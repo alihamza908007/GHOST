@@ -1,0 +1,12 @@
+{
+  "name": "@ghost/engine",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "dependencies": {
+    "@ghost/core": "*",
+    "@ghost/storage": "*",
+    "playwright": "^1.40.0"
+  }
+}

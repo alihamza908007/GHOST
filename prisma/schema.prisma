@@ -1,0 +1,26 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model Task {
+  id              String      @id
+  objective       String
+  status          String
+  currentStepIndex Int
+  lastEventId     String?
+  events          TaskEvent[]
+}
+
+model TaskEvent {
+  id        String   @id
+  taskId    String
+  type      String
+  timestamp BigInt
+  data      String   // We will store JSON as string for SQLite compatibility if needed, or use Json type
+  task      Task     @relation(fields: [taskId], references: [id])
+}
