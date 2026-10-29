@@ -17,6 +17,7 @@ import {
   Ban,
   ThumbsUp,
   ThumbsDown,
+  Eye,
 } from 'lucide-react';
 
 const API = process.env.NEXT_PUBLIC_GHOST_API_URL || 'http://localhost:3002';
@@ -85,13 +86,16 @@ interface ModelHealth {
 
 const TERMINAL = ['COMPLETED', 'FAILED', 'CANCELLED'];
 
-const STAGE_ORDER = ['PLANNING', 'PLAN_READY', 'EXECUTING', 'VERIFYING', 'COMPLETED'];
+const STAGE_ORDER = ['PLANNING', 'PLAN_READY', 'EXECUTING', 'VERIFYING', 'RETRYING', 'COMPLETED'];
+
+const MAX_RECOVERY_LIMIT = 2;
 
 function statusColor(status: string): string {
   if (status === 'COMPLETED') return 'bg-green-500/10 text-green-400 border-green-500/20';
   if (status === 'FAILED') return 'bg-red-500/10 text-red-400 border-red-500/20';
   if (status === 'CANCELLED') return 'bg-zinc-500/10 text-zinc-400 border-zinc-500/20';
   if (status === 'AWAITING_APPROVAL') return 'bg-amber-500/10 text-amber-300 border-amber-500/20';
+  if (status === 'RETRYING') return 'bg-amber-500/10 text-amber-300 border-amber-500/20';
   return 'bg-blue-500/10 text-blue-400 border-blue-500/20';
 }
 
@@ -180,6 +184,64 @@ function eventSummary(event: TaskEvent): { title: string; detail?: string; tone:
       return { title: 'Action approved', detail: detailValue, tone: 'text-green-400' };
     case 'APPROVAL_REJECTED':
       return { title: 'Action rejected', detail: detailValue, tone: 'text-red-400' };
+    case 'VISUAL_OBSERVATION_STARTED':
+      return {
+        title: 'Visual observation started',
+        detail: `Checking expected condition: ${String(data.expectedCondition ?? 'present')}`,
+        tone: 'text-blue-400',
+      };
+    case 'VISUAL_OBSERVATION_COMPLETED':
+      return {
+        title: 'Visual observation complete',
+        detail: [
+          typeof data.summary === 'string' ? data.summary : undefined,
+          typeof data.expectedCondition === 'string' ? `expected: ${data.expectedCondition}` : undefined,
+        ]
+          .filter(Boolean)
+          .join(' · '),
+        tone: data.available === false ? 'text-amber-300' : 'text-green-400',
+      };
+    case 'VISUAL_UNAVAILABLE':
+      return {
+        title: 'Visual observation unavailable',
+        detail: typeof data.reason === 'string' ? data.reason : 'Local vision model did not produce evidence',
+        tone: 'text-amber-300',
+      };
+    case 'DOM_VISUAL_DISAGREEMENT':
+      return {
+        title: 'Deterministic and visual checks disagreed',
+        detail: [
+          typeof data.deterministicOutcome === 'string' ? `deterministic: ${data.deterministicOutcome}` : undefined,
+          typeof data.visualSummary === 'string' ? `visual: ${data.visualSummary}` : undefined,
+        ]
+          .filter(Boolean)
+          .join(' · '),
+        tone: 'text-amber-300',
+      };
+    case 'RECOVERY_STARTED':
+      return {
+        title: 'Bounded recovery started',
+        detail: `Recovery attempt ${String(data.recoveryAttempt ?? '')}${
+          typeof data.stepIndex === 'number' ? ` at step ${data.stepIndex + 1}` : ''
+        }`,
+        tone: 'text-amber-300',
+      };
+    case 'RECOVERY_COMPLETED':
+      return { title: 'Bounded recovery completed', detail: detailValue, tone: 'text-green-400' };
+    case 'RETRY_AUTHORIZED':
+      return {
+        title: 'Retry authorized by recovery policy',
+        detail: detailValue,
+        tone: 'text-blue-400',
+      };
+    case 'RETRY_REJECTED':
+      return { title: 'Retry rejected', detail: detailValue, tone: 'text-red-400' };
+    case 'RECOVERY_BUDGET_EXHAUSTED':
+      return {
+        title: 'Recovery budget exhausted',
+        detail: detailValue,
+        tone: 'text-red-400',
+      };
     case 'TASK_CANCELLED':
       return { title: 'Task cancelled', detail: detailValue, tone: 'text-zinc-400' };
     case 'TASK_COMPLETED':
@@ -508,7 +570,7 @@ export default function Dashboard() {
                   )}
                 </div>
 
-                <div className="grid grid-cols-5 gap-2 mt-4">
+                <div className="grid grid-cols-6 gap-2 mt-4">
                   {STAGE_ORDER.map((stage, index) => {
                     const active = index <= stageIndex(task.status);
                     const current = index === stageIndex(task.status) && !TERMINAL.includes(task.status);

@@ -1,3 +1,9 @@
+import type {
+  VisualCondition,
+  VisualObservation,
+  VisualObservationInput,
+} from '@ghost/core';
+
 export type ModelErrorCode =
   | 'CONNECTION_FAILED'
   | 'MODEL_NOT_FOUND'
@@ -64,6 +70,22 @@ export interface StructuredGenerationResult {
   latencyMs: number;
 }
 
+export interface VisionGenerationRequest {
+  requestId: string;
+  system: string;
+  user: string;
+  /** Base64-encoded image bytes (PNG/JPEG) sent through Ollama's `images` field. */
+  imageBase64: string;
+  maxOutputTokens?: number;
+  signal?: AbortSignal;
+}
+
+export interface VisionGenerationResult {
+  text: string;
+  model: string;
+  latencyMs: number;
+}
+
 /**
  * Vendor-neutral surface used by the planner and the server. The browser
  * engine never imports this package, so execution does not depend on Ollama.
@@ -77,6 +99,18 @@ export interface ModelProvider {
   generateStructured(
     request: StructuredGenerationRequest
   ): Promise<StructuredGenerationResult>;
+  generateVision?(request: VisionGenerationRequest): Promise<VisionGenerationResult>;
   cancel(requestId: string): void;
   cancelAll(): void;
+}
+
+/**
+ * Local visual perception boundary. Implementations must keep model output
+ * untrusted and must never be used as authorization for execution.
+ */
+export interface IVisualObserver {
+  readonly name: string;
+  readonly model: string;
+  observe(input: VisualObservationInput): Promise<VisualObservation>;
+  probe(options?: ProviderProbeOptions): Promise<ModelProviderCapabilities>;
 }

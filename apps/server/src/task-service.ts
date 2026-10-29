@@ -205,6 +205,11 @@ export class TaskService {
       if (error instanceof ServiceError) {
         throw error;
       }
+      if (task.status === 'CANCELLED') {
+        // A cancellation that landed while a recovery or vision step was in
+        // flight must not be overwritten with a failure reason.
+        return { status: 'cancelled', error: task.error ?? 'Cancelled by user', executedActions: 0 };
+      }
       await this.taskRepo.update(task.id, {
         status: 'FAILED',
         error: 'Planning or execution failed safely',

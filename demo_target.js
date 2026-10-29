@@ -85,26 +85,138 @@ const injected = page(
   `
 );
 
+const overlay = page(
+  'GHOST Demo Application',
+  `
+    <h1>GHOST Demo Application</h1>
+    <p>An obstructing overlay scenario for bounded visual recovery.</p>
+
+    <div class="content">
+      <button type="button" data-testid="show-message">Show message</button>
+      <div id="message" class="success hidden" role="status">Message displayed</div>
+    </div>
+
+    <div id="overlay" class="overlay">
+      <div class="card">
+        <h2>Action temporarily unavailable</h2>
+        <p>The requested action is blocked by the demo overlay.</p>
+        <button type="button" id="overlay-close">Close</button>
+      </div>
+    </div>
+
+    <style>
+      .overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(15, 23, 42, 0.45); z-index: 10; }
+      .overlay .card { background: white; padding: 2rem; border-radius: 14px; max-width: 420px; text-align: center; }
+      .overlay .card button { margin-top: 1rem; padding: .6rem 1.2rem; border: 0; border-radius: 8px; background: #18181b; color: white; font: inherit; font-weight: 600; }
+    </style>
+
+    <script>
+      document.getElementById('show-message').addEventListener('click', function () {
+        document.getElementById('message').classList.remove('hidden');
+      });
+      document.getElementById('overlay-close').addEventListener('click', function () {\n        document.getElementById('overlay').classList.add('hidden');\n      });\n      document.getElementById('overlay').classList.add('hidden');\n    </script>", "oldString">
+      document.getElementById('overlay-close').addEventListener('click', function () {\n        document.getElementById('overlay').classList.add('hidden');\n      });\n    </script>", "path">
+/Users/bob/Desktop/GHOST/demo_target.js
+  `
+);
+
+const validationError = page(
+  'GHOST Demo Application',
+  `
+    <h1>GHOST Demo Application</h1>
+    <p>A visible form-validation error scenario.</p>
+    <form id="signup-form" aria-label="Demo signup form">
+      <label for="signup-email">Email</label>
+      <input id="signup-email" name="email" type="email" autocomplete="off" />
+      <label for="signup-code">Verification code</label>
+      <input id="signup-code" name="code" type="text" autocomplete="off" />
+      <button type="submit">Sign up</button>
+    </form>
+    <div id="signup-error" class="success" role="alert">The email address is already registered</div>
+  `
+);
+
+const missingTarget = page(
+  'GHOST Demo Application',
+  `
+    <h1>GHOST Demo Application</h1>
+    <p>An expected target element that does not exist.</p>
+  `
+);
+
+const consequential = page(
+  'GHOST Demo Application',
+  `
+    <h1>GHOST Demo Application</h1>
+    <p>A high-consequence action scenario (destructive delete).</p>
+    <button type="button" data-testid="delete-account">Delete account</button>
+    <div id="deleted" class="success hidden" role="status">Account deleted</div>
+    <script>
+      document.querySelector('[data-testid="delete-account"]').addEventListener('click', function () {
+        document.getElementById('deleted').classList.remove('hidden');
+      });
+    </script>
+  `
+);
+
+const alreadyTrue = page(
+  'GHOST Demo Application',
+  `
+    <h1>GHOST Demo Application</h1>
+    <p>The success indicator is already visible before any action.</p>
+    <div id="message" class="success" role="status">Message displayed</div>
+    <button type="button" data-testid="show-message">Show message</button>
+  `
+);
+
 function createDemoServer() {
   return http.createServer((req, res) => {
     const pathname = new URL(req.url || '/', 'http://127.0.0.1').pathname;
+    const scenario = (new URL(req.url || '/', 'http://127.0.0.1').searchParams.get('scenario') || 'default').toLowerCase();
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
 
-    if (req.method === 'GET' && pathname === '/') {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(home);
-      return;
-    }
-    if (req.method === 'GET' && pathname === '/about') {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(about);
-      return;
-    }
-    if (req.method === 'GET' && pathname === '/injected') {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(injected);
-      return;
+    if (req.method === 'GET') {
+      if (scenario === 'overlay') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(overlay);
+        return;
+      }
+      if (scenario === 'validation-error') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(validationError);
+        return;
+      }
+      if (scenario === 'missing-target') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(missingTarget);
+        return;
+      }
+      if (scenario === 'consequential') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(consequential);
+        return;
+      }
+      if (scenario === 'already-true') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(alreadyTrue);
+        return;
+      }
+      if (req.method === 'GET' && pathname === '/') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(home);
+        return;
+      }
+      if (req.method === 'GET' && pathname === '/about') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(about);
+        return;
+      }
+      if (req.method === 'GET' && pathname === '/injected') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(injected);
+        return;
+      }
     }
     if (req.method === 'GET' && pathname === '/favicon.ico') {
       res.writeHead(204);

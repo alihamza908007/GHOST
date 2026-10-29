@@ -10,6 +10,7 @@ import {
   isModelError,
   ModelProviderCapabilities,
   OllamaProvider,
+  OllamaVisionObserver,
   StructuredPlanner,
 } from '@ghost/models';
 import { createApp, ModelHealth } from './app.js';
@@ -62,6 +63,12 @@ async function main(): Promise<void> {
     model: config.plannerModel,
     timeoutMs: config.ollamaTimeoutMs,
   });
+  const visionProvider = new OllamaProvider({
+    baseUrl: config.ollamaBaseUrl,
+    model: config.visionModel,
+    timeoutMs: config.ollamaTimeoutMs,
+  });
+  const visionObserver = new OllamaVisionObserver(visionProvider, config.ollamaTimeoutMs, 256);
   const planner = new StructuredPlanner(provider, { policy });
   const engine = new ExecutionEngine(
     taskRepo,
@@ -73,6 +80,12 @@ async function main(): Promise<void> {
       approvalRepo,
       taskTimeoutMs: config.executionTimeoutMs,
       actionTimeoutMs: config.actionTimeoutMs,
+      visual: visionObserver,
+      visionTimeoutMs: config.ollamaTimeoutMs,
+      redactScreenshots: config.redactScreenshots,
+      recoveryLimit: 2,
+      maxRetriesPerAction: 1,
+      recoveryCloseAllowlist: ['Close', 'testid:overlay-close'],
     }
   );
 
@@ -110,16 +123,31 @@ async function main(): Promise<void> {
       error = { code, message };
     }
 
+    let visionCapabilities: ModelProviderCapabilities | null = null;
+    let visionError: ModelHealth['error'] = null;
+    try {
+      visionCapabilities = await visionObserver.probe();
+    } catch (probeError) {
+      const code = isModelError(probeError) ? probeError.code : 'CONNECTION_FAILED';
+      const message = isModelError(probeError)
+        ? probeError.message
+        : 'Unable to probe the local vision model';
+      visionError = { code, message };
+    }
+
     const snapshot: CapabilitySnapshot = {
       plannerModel: config.plannerModel,
       connected: capabilities?.connected ?? error?.code !== 'CONNECTION_FAILED',
       modelAvailable: capabilities?.modelAvailable ?? false,
       textGeneration: capabilities?.textGeneration ?? false,
       structuredOutput: capabilities?.structuredOutput ?? false,
-      vision: capabilities?.vision ?? false,
+      vision: capabilities?.vision ?? visionCapabilities?.vision ?? false,
       degradedFeatures: capabilities?.degradedFeatures ?? ['planner_unavailable'],
       lastErrorCode: error?.code,
       checkedAt: now,
+      visionModel: config.visionModel,
+      visionConnected: visionCapabilities?.connected ?? false,
+      visionLastErrorCode: visionError?.code,
     };
 
     const value: ModelHealth = { capabilities: snapshot, error };
@@ -131,6 +159,7 @@ async function main(): Promise<void> {
 
   const shutdown = async () => {
     provider.cancelAll();
+    visionProvider.cancelAll();
     await app.close().catch(() => undefined);
     await prisma.$disconnect().catch(() => undefined);
   };
@@ -141,6 +170,7 @@ async function main(): Promise<void> {
   console.log(`GHOST Phase 2 server running at http://localhost:${config.port}`);
   console.log(`Allowed demo origin: ${config.allowedOrigin}`);
   console.log(`Planner model: ${config.plannerModel} (local Ollama only)`);
+  console.log(`Vision model: ${config.visionModel} (local Ollama only, optional)`);
 }
 
 main().catch((error) => {

@@ -37,11 +37,13 @@ export interface GhostConfig {
   dashboardOrigins: string[];
   ollamaBaseUrl: string;
   plannerModel: string;
+  visionModel: string;
   ollamaTimeoutMs: number;
   executionTimeoutMs: number;
   actionTimeoutMs: number;
   evidenceDir: string;
   modelProbeCacheMs: number;
+  redactScreenshots: boolean;
 }
 
 function positiveInt(value: string | undefined, fallback: number): number {
@@ -85,10 +87,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GhostConfig {
     dashboardOrigins,
     ollamaBaseUrl: env.OLLAMA_BASE_URL ?? 'http://127.0.0.1:11434',
     plannerModel: env.OLLAMA_PLANNER_MODEL ?? 'gpt-oss:20b',
+    visionModel: env.OLLAMA_VISION_MODEL ?? 'lfm3-omni:2b',
     ollamaTimeoutMs: positiveInt(env.OLLAMA_TIMEOUT_MS, 45_000),
     executionTimeoutMs: positiveInt(env.GHOST_EXECUTION_TIMEOUT_MS, 120_000),
     actionTimeoutMs: positiveInt(env.GHOST_ACTION_TIMEOUT_MS, 15_000),
     evidenceDir,
     modelProbeCacheMs: positiveInt(env.GHOST_MODEL_PROBE_CACHE_MS, 60_000),
+    redactScreenshots: env.GHOST_REDACT_SCREENSHOTS !== 'false',
   };
 }

@@ -5,6 +5,8 @@ import {
   ProviderProbeOptions,
   StructuredGenerationRequest,
   StructuredGenerationResult,
+  VisionGenerationRequest,
+  VisionGenerationResult,
 } from './types.js';
 
 export interface OllamaProviderConfig {
@@ -18,6 +20,8 @@ export interface OllamaProviderConfig {
   maxResponseBytes?: number;
   maxPromptChars?: number;
   fetchImpl?: typeof fetch;
+  /** Maximum accepted base64 image size for vision requests. */
+  maxImageBytes?: number;
 }
 
 const DEFAULTS = {
@@ -27,6 +31,7 @@ const DEFAULTS = {
   maxOutputTokens: 2_048,
   maxResponseBytes: 256 * 1024,
   maxPromptChars: 24_000,
+  maxImageBytes: 8 * 1024 * 1024,
 };
 
 function isLoopbackHost(hostname: string): boolean {
@@ -49,6 +54,7 @@ export class OllamaProvider implements ModelProvider {
   private readonly maxOutputTokens: number;
   private readonly maxResponseBytes: number;
   private readonly maxPromptChars: number;
+  private readonly maxImageBytes: number;
   private readonly fetchImpl: typeof fetch;
   private readonly active = new Map<string, AbortController>();
 
@@ -80,6 +86,7 @@ export class OllamaProvider implements ModelProvider {
     );
     this.maxResponseBytes = config.maxResponseBytes ?? DEFAULTS.maxResponseBytes;
     this.maxPromptChars = config.maxPromptChars ?? DEFAULTS.maxPromptChars;
+    this.maxImageBytes = config.maxImageBytes ?? DEFAULTS.maxImageBytes;
     this.fetchImpl = config.fetchImpl ?? fetch;
   }
 
@@ -283,6 +290,85 @@ export class OllamaProvider implements ModelProvider {
       model: typeof body.model === 'string' ? body.model : this.model,
       latencyMs: Date.now() - startedAt,
     };
+  }
+
+  async generateVision(request: VisionGenerationRequest): Promise<VisionGenerationResult> {
+    const imageBytes = this.decodeBase64Image(request.imageBase64);
+    const maxOutputTokens = Math.min(request.maxOutputTokens ?? 512, 1_024);
+    const startedAt = Date.now();
+
+    const body = await this.runWithTimeout(
+      request.requestId,
+      request.signal,
+      this.timeoutMs,
+      async (signal) =>
+        this.postJson(
+          '/api/chat',
+          {
+            model: this.model,
+            stream: false,
+            options: {
+              temperature: 0,
+              num_predict: maxOutputTokens,
+              num_ctx: 8_192,
+            },
+            messages: [
+              { role: 'system', content: request.system },
+              { role: 'user', content: request.user, images: [request.imageBase64] },
+            ],
+          },
+          signal
+        )
+    );
+    if (!body || typeof body !== 'object') {
+      throw new ModelError('GENERATION_FAILED', 'Ollama returned an invalid vision response');
+    }
+    if (body.error) {
+      const message = safeErrorText(body.error);
+      if (/not found|unknown model|no such model|unsupported/i.test(message)) {
+        throw new ModelError('UNSUPPORTED_IMAGE_INPUT', message || 'The vision model cannot process images');
+      }
+      throw new ModelError('GENERATION_FAILED', message || 'Ollama vision returned a generation error');
+    }
+
+    const content = body?.message?.content;
+    if (typeof content !== 'string' || content.trim().length === 0) {
+      throw new ModelError(
+        'MALFORMED_OUTPUT',
+        'The vision model returned an empty response',
+        true
+      );
+    }
+    if (content.length > this.maxResponseBytes) {
+      throw new ModelError('RESPONSE_TOO_LARGE', 'The vision response exceeded the output limit');
+    }
+
+    return {
+      text: content,
+      model: typeof body.model === 'string' ? body.model : this.model,
+      latencyMs: Date.now() - startedAt,
+    };
+  }
+
+  private decodeBase64Image(imageBase64: string): Uint8Array {
+    if (typeof imageBase64 !== 'string' || imageBase64.length === 0) {
+      throw new ModelError('INVALID_REQUEST', 'A base64 image is required for vision requests');
+    }
+    const byteLength = Math.floor((imageBase64.length * 3) / 4);
+    if (byteLength > this.maxImageBytes) {
+      throw new ModelError(
+        'INVALID_REQUEST',
+        `Screenshot exceeds the ${this.maxImageBytes}-byte vision limit`
+      );
+    }
+    const bytes = Buffer.from(imageBase64, 'base64');
+    if (bytes.length === 0 || bytes.length > this.maxImageBytes) {
+      throw new ModelError(
+        'INVALID_REQUEST',
+        `Screenshot image data is invalid or exceeds the ${this.maxImageBytes}-byte vision limit`
+      );
+    }
+    return new Uint8Array(bytes);
   }
 
   private async getJson(path: string, signal: AbortSignal): Promise<any> {

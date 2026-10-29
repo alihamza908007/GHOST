@@ -1,4 +1,4 @@
-# GHOST — Phase 2: Local Structured Planning
+# GHOST — Phase 3: Local Visual Perception and Bounded Recovery
 
 GHOST is a local browser agent. Phase 2 adds a local Ollama planner while keeping
 the Phase 1 execution, security, persistence, evidence, and dashboard layers
@@ -224,7 +224,11 @@ Real local-model checks (this machine, Ollama 0.40.12, `gpt-oss:20b`):
 - **Restart persistence:** completed tasks retained status, plan, ordered events,
   approvals, and evidence; history lists newest first.
 
-## Known limitations and deferred Phase 3
+## Known limitations and deferred Phase 4
+
+See `PHASE3_REPORT.md` for the Phase 3 completion report and testing plan.
+Phase 4 (voice/audio/video, multi-origin, desktop control, multi-agent) is
+intentionally not implemented.
 
 - Verification is DOM/evidence-based only; there is no visual model judgment.
 - The planner supports four actions and a single demo origin; multi-site and

@@ -7,6 +7,8 @@ import {
   TaskEvent,
   TaskEventType,
   TaskStatus,
+  isSafeEvidenceFilename,
+  resolveContainedEvidencePath,
 } from '@ghost/core';
 import { PrismaClient } from '@prisma/client';
 import path from 'path';
@@ -189,7 +191,7 @@ export class TaskRepository implements ITaskRepository {
     const interrupted = await this.prisma.task.findMany({
       where: {
         status: {
-          in: ['PLANNING', 'PLAN_READY', 'EXECUTING', 'VERIFYING', 'AWAITING_APPROVAL'],
+          in: ['PLANNING', 'PLAN_READY', 'EXECUTING', 'VERIFYING', 'RETRYING', 'AWAITING_APPROVAL'],
         },
       },
     });
@@ -304,6 +306,9 @@ export class EvidenceRepository implements IEvidenceRepository {
     timestamp: number;
     size?: number;
   }): Promise<void> {
+    if (!isSafeEvidenceFilename(evidence.filename)) {
+      throw new Error('Unsafe evidence filename');
+    }
     if (!this.prisma) return;
     const size = evidence.size ?? this.size(evidence.filename);
     await this.prisma.evidence.create({
@@ -319,11 +324,15 @@ export class EvidenceRepository implements IEvidenceRepository {
   }
 
   getFilePath(filename: string): string {
-    return path.resolve(this.baseDir, filename);
+    return resolveContainedEvidencePath(this.baseDir, filename);
   }
 
   exists(filename: string): boolean {
-    return fs.existsSync(this.getFilePath(filename));
+    try {
+      return fs.existsSync(this.getFilePath(filename));
+    } catch {
+      return false;
+    }
   }
 
   size(filename: string): number {
