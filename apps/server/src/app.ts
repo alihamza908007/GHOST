@@ -14,7 +14,18 @@ export interface AppDependencies {
   config: GhostConfig;
   taskService: TaskService;
   getModelHealth: () => Promise<ModelHealth>;
+  skillRepo?: { save: (s: any) => Promise<void>; list: () => Promise<any[]>; get: (id: string) => Promise<any | null> };
+  skillRunRepo?: { create: (r: any) => Promise<void>; complete: (id: string, status: string, error?: string) => Promise<void>; list: (skillId?: string) => Promise<any[]> };
 }
+
+const ResearchBodySchema = z
+  .object({
+    objective: z.string().min(1),
+    approvedOrigins: z.array(z.string()).min(1),
+    fields: z.array(z.object({ name: z.string().min(1), type: z.string(), description: z.string().optional() })).optional(),
+    pageBudget: z.number().int().positive().max(20).optional(),
+  })
+  .strict();
 
 const StartBodySchema = z
   .object({
@@ -133,6 +144,24 @@ export async function createApp(
     }
   });
 
+  fastify.post('/research', async (request, reply) => {
+    const parsed = ResearchBodySchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'Invalid request body', code: 'INVALID_REQUEST' });
+    }
+    try {
+      const task = await taskService.startResearch(
+        parsed.data.objective,
+        parsed.data.approvedOrigins,
+        parsed.data.fields ?? [],
+        parsed.data.pageBudget ?? 5
+      );
+      return reply.code(202).send({ taskId: task.id, task: publicTask(task) });
+    } catch (error) {
+      return sendServiceError(reply, error);
+    }
+  });
+
   fastify.get('/tasks', async () => {
     const tasks = await taskService.listTasks();
     return { tasks: tasks.map(publicTask) };
@@ -211,6 +240,42 @@ export async function createApp(
       return reply.code(404).send({ error: 'No screenshot found', code: 'NOT_FOUND' });
     }
     return { url: `/evidence/${encodeURIComponent(filename)}` };
+  });
+
+  fastify.get('/skills', async () => {
+    if (!deps.skillRepo) return { skills: [] };
+    const skills = await deps.skillRepo.list();
+    return { skills };
+  });
+
+  fastify.post('/skills', async (request, reply) => {
+    if (!deps.skillRepo) return reply.code(503).send({ error: 'Skill store unavailable', code: 'UNAVAILABLE' });
+    const body = (request.body ?? {}) as { name?: string; definition?: unknown };
+    if (!body.name || !body.definition) {
+      return reply.code(400).send({ error: 'name and definition required', code: 'INVALID_REQUEST' });
+    }
+    const id = `skill-${Date.now()}`;
+    await deps.skillRepo.save({ id, name: body.name, definition: body.definition });
+    return reply.code(201).send({ id });
+  });
+
+  fastify.post<{ Params: { id: string } }>('/skills/:id/run', async (request, reply) => {
+    if (!deps.skillRepo) return reply.code(503).send({ error: 'Skill store unavailable', code: 'UNAVAILABLE' });
+    const skill = await deps.skillRepo.get(request.params.id);
+    if (!skill) return reply.code(404).send({ error: 'Skill not found', code: 'NOT_FOUND' });
+    const body = (request.body ?? {}) as { inputs?: Record<string, unknown>; approvedOrigins?: string[] };
+    try {
+      const task = await taskService.runSkill(skill, body.inputs ?? {}, body.approvedOrigins);
+      return reply.code(202).send({ taskId: task.id });
+    } catch (error) {
+      return sendServiceError(reply, error);
+    }
+  });
+
+  fastify.get<{ Params: { id: string } }>('/skills/:id/runs', async (request, reply) => {
+    if (!deps.skillRunRepo) return reply.code(503).send({ error: 'Skill run store unavailable', code: 'UNAVAILABLE' });
+    const runs = await deps.skillRunRepo.list(request.params.id);
+    return { runs };
   });
 
   return fastify;

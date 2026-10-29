@@ -169,6 +169,17 @@ const alreadyTrue = page(
   `
 );
 
+const research = page(
+  'GHOST Research Fixture',
+  `
+    <h1>GHOST Research Fixture</h1>
+    <p>Product: GHOST Browser Agent</p>
+    <p>Version: 1.2.3</p>
+    <p>License: MIT</p>
+    <p>Author: GHOST Team</p>
+  `
+);
+
 function createDemoServer() {
   return http.createServer((req, res) => {
     const pathname = new URL(req.url || '/', 'http://127.0.0.1').pathname;
@@ -200,6 +211,11 @@ function createDemoServer() {
       if (scenario === 'already-true') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(alreadyTrue);
+        return;
+      }
+      if (scenario === 'research') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(research);
         return;
       }
       if (req.method === 'GET' && pathname === '/') {

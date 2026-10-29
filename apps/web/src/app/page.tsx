@@ -62,6 +62,7 @@ interface Task {
   currentStep?: number;
   plan: Plan | null;
   approvedOrigins?: string[] | null;
+  researchResultJson?: string | null;
   planSummary?: string | null;
   plannerModel?: string | null;
   error?: string | null;
@@ -278,6 +279,24 @@ export default function Dashboard() {
   const [approvalBusy, setApprovalBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [modelHealth, setModelHealth] = useState<ModelHealth | null>(null);
+  const [skills, setSkills] = useState<Array<{ id: string; name: string }>>([]);
+  const [skillName, setSkillName] = useState('');
+  const [skillInputs, setSkillInputs] = useState('');
+  const [runningSkill, setRunningSkill] = useState<string | null>(null);
+  const [researchObjective, setResearchObjective] = useState('');
+  const [researchOrigins, setResearchOrigins] = useState('');
+  const [researchFields, setResearchFields] = useState('');
+
+  const refreshSkills = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/skills`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setSkills(Array.isArray(data.skills) ? data.skills : []);
+    } catch {
+      // non-critical
+    }
+  }, []);
 
   const refreshTasks = useCallback(async () => {
     try {
@@ -306,7 +325,8 @@ export default function Dashboard() {
   useEffect(() => {
     void refreshTasks();
     void refreshModelHealth();
-  }, [refreshTasks, refreshModelHealth]);
+    void refreshSkills();
+  }, [refreshTasks, refreshModelHealth, refreshSkills]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -432,6 +452,50 @@ export default function Dashboard() {
     }
   };
 
+  const saveSkill = async () => {
+    if (!task || task.status !== 'COMPLETED' || !skillName.trim()) return;
+    try {
+      const res = await fetch(`${API}/skills`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: skillName.trim(), definition: { objective: task.objective, steps: task.plan?.steps ?? [] } }),
+      });
+      if (res.ok) {
+        setSkillName('');
+        void refreshSkills();
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const runResearch = async () => {
+    if (!researchObjective.trim()) return;
+    setIsStarting(true);
+    try {
+      let fields: Array<{ name: string; type: string }> = [];
+      if (researchFields.trim()) {
+        try { fields = JSON.parse(researchFields); } catch { fields = []; }
+      }
+      const res = await fetch(`${API}/research`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          objective: researchObjective,
+          approvedOrigins: researchOrigins.split(',').map((s) => s.trim()).filter(Boolean),
+          fields,
+          pageBudget: 5,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok && data.taskId) selectTask(data.taskId);
+    } catch {
+      // ignore
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
   const health = modelHealth?.capabilities;
   const modelOk = Boolean(health?.connected && health?.modelAvailable && !modelHealth?.error);
   const modelDetail = modelHealth?.error
@@ -475,6 +539,8 @@ export default function Dashboard() {
             />
             <div className="flex items-center justify-between mt-3 gap-3">
               <span className="text-[11px] text-zinc-600">{objective.length}/1000</span>
+            </div>
+            <div className="mt-3">
               <label className="text-[11px] text-zinc-600 block mb-1">Approved origins (comma-separated, optional)</label>
               <input
                 value={approvedOrigins}
@@ -540,6 +606,73 @@ export default function Dashboard() {
                 </button>
               ))}
             </div>
+          </div>
+
+          <div className="bg-[#161616] border border-zinc-800 p-5 rounded-2xl">
+            <h2 className="text-zinc-400 text-sm font-medium mb-3">Saved skills</h2>
+            {skills.length === 0 && <p className="text-zinc-600 text-sm">No skills saved yet.</p>}
+            <div className="space-y-1">
+              {skills.map((s) => (
+                <div key={s.id} className="text-xs text-zinc-300 border border-zinc-800 rounded-lg p-2 flex items-center justify-between gap-2">
+                  <span>{s.name}</span>
+                  <button
+                    onClick={async () => {
+                      setRunningSkill(s.id);
+                      try {
+                        let inputs: Record<string, unknown> = {};
+                        if (skillInputs.trim()) {
+                          try { inputs = JSON.parse(skillInputs); } catch { inputs = {}; }
+                        }
+                        const res = await fetch(`${API}/skills/${s.id}/run`, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ inputs }),
+                        });
+                        const data = await res.json();
+                        if (res.ok && data.taskId) selectTask(data.taskId);
+                      } finally {
+                        setRunningSkill(null);
+                      }
+                    }}
+                    disabled={runningSkill === s.id}
+                    className="text-[10px] bg-zinc-800 text-zinc-200 rounded px-2 py-1 disabled:opacity-50"
+                  >
+                    {runningSkill === s.id ? 'Running…' : 'Run'}
+                  </button>
+                </div>
+              ))}
+            </div>
+            <input
+              value={skillInputs}
+              onChange={(e) => setSkillInputs(e.target.value)}
+              placeholder='Inputs JSON (optional)'
+              className="mt-2 w-full bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200"
+            />
+          </div>
+          <div className="bg-[#161616] border border-zinc-800 p-5 rounded-2xl">
+            <h2 className="text-zinc-400 text-sm font-medium mb-3">Research</h2>
+            <textarea
+              value={researchObjective}
+              onChange={(e) => setResearchObjective(e.target.value)}
+              placeholder="Research objective"
+              rows={3}
+              className="w-full bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200 resize-none mb-2"
+            />
+            <input
+              value={researchOrigins}
+              onChange={(e) => setResearchOrigins(e.target.value)}
+              placeholder="Approved origins (comma-separated)"
+              className="w-full bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200 mb-2"
+            />
+            <input
+              value={researchFields}
+              onChange={(e) => setResearchFields(e.target.value)}
+              placeholder='Fields JSON: [{"name":"Version","type":"string"}]'
+              className="w-full bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200 mb-2"
+            />
+            <button onClick={() => void runResearch()} disabled={isStarting || !researchObjective.trim()} className="w-full text-xs bg-white text-black rounded-xl px-3 py-2 font-medium disabled:opacity-50">
+              {isStarting ? 'Running…' : 'Run research'}
+            </button>
           </div>
         </section>
 
@@ -626,6 +759,70 @@ export default function Dashboard() {
                   <p className="text-xs text-zinc-500 mt-1">
                     Approved origins: {task.approvedOrigins.join(', ')}
                   </p>
+                )}
+                {task.researchResultJson && (
+                  <div className="mt-3 border border-zinc-800 rounded-xl p-3">
+                    <p className="text-xs text-zinc-400 mb-2">Research findings</p>
+                    <pre className="text-[10px] text-zinc-300 whitespace-pre-wrap break-words">{task.researchResultJson}</pre>
+                    <div className="flex gap-2 mt-2">
+                      <button
+                        onClick={() => {
+                          if (!task.researchResultJson) return;
+                          const blob = new Blob([task.researchResultJson], { type: 'application/json' });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url;
+                          a.download = `research-${task.id}.json`;
+                          a.click();
+                          URL.revokeObjectURL(url);
+                        }}
+                        className="text-[10px] bg-zinc-800 text-zinc-200 rounded px-2 py-1"
+                      >
+                        Export JSON
+                      </button>
+                      <button
+                        onClick={() => {
+                          if (!task.researchResultJson) return;
+                          try {
+                            const parsed = JSON.parse(task.researchResultJson);
+                            const findings = Array.isArray(parsed.findings) ? parsed.findings : [];
+                            const rows = [['field', 'value', 'status', 'sourceUrl']];
+                            for (const f of findings) {
+                              rows.push([f.field ?? '', f.value ?? '', f.status ?? '', f.sourceUrl ?? '']);
+                            }
+                            const csv = rows
+                              .map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(','))
+                              .join('\n');
+                            const blob = new Blob([csv], { type: 'text/csv' });
+                            const url = URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.href = url;
+                            a.download = `research-${task.id}.csv`;
+                            a.click();
+                            URL.revokeObjectURL(url);
+                          } catch {
+                            // ignore
+                          }
+                        }}
+                        className="text-[10px] bg-zinc-800 text-zinc-200 rounded px-2 py-1"
+                      >
+                        Export CSV
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {task.status === 'COMPLETED' && (
+                  <div className="mt-3 flex gap-2">
+                    <input
+                      value={skillName}
+                      onChange={(e) => setSkillName(e.target.value)}
+                      placeholder="Save as skill name"
+                      className="flex-1 bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200"
+                    />
+                    <button onClick={() => void saveSkill()} className="text-xs bg-zinc-800 text-zinc-200 rounded-xl px-3 py-2">
+                      Save skill
+                    </button>
+                  </div>
                 )}
               </div>
 
@@ -766,6 +963,31 @@ export default function Dashboard() {
               </div>
             </>
           )}
+          <div className="bg-[#161616] border border-zinc-800 p-5 rounded-2xl">
+            <h2 className="text-zinc-400 text-sm font-medium mb-3">Research</h2>
+            <textarea
+              value={researchObjective}
+              onChange={(e) => setResearchObjective(e.target.value)}
+              placeholder="Research objective"
+              rows={3}
+              className="w-full bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200 resize-none mb-2"
+            />
+            <input
+              value={researchOrigins}
+              onChange={(e) => setResearchOrigins(e.target.value)}
+              placeholder="Approved origins (comma-separated)"
+              className="w-full bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200 mb-2"
+            />
+            <input
+              value={researchFields}
+              onChange={(e) => setResearchFields(e.target.value)}
+              placeholder='Fields JSON: [{"name":"Version","type":"string"}]'
+              className="w-full bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200 mb-2"
+            />
+            <button onClick={() => void runResearch()} disabled={isStarting || !researchObjective.trim()} className="w-full text-xs bg-white text-black rounded-xl px-3 py-2 font-medium disabled:opacity-50">
+              {isStarting ? 'Running…' : 'Run research'}
+            </button>
+          </div>
         </section>
       </main>
     </div>

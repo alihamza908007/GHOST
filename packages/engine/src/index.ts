@@ -44,6 +44,13 @@ import {
   verifyAction,
 } from './verification.js';
 
+export interface IPlanProvider {
+  plan(
+    context: { objective: string; observations?: string[]; approvedOrigins?: string[]; priorActions?: any[] },
+    options: { requestId: string; signal?: AbortSignal }
+  ): Promise<{ plan: Plan; attempts: number; latencyMs: number; model: string }>;
+}
+
 export interface IExecutionEngine {
   executePlan(
     task: Task,
@@ -70,6 +77,8 @@ export interface ExecutionEngineOptions {
   tools?: BrowserToolRegistry;
   /** Optional local visual perception collaborator. */
   visual?: VisualObserverLike;
+  /** Optional planner for adaptive replanning. */
+  planner?: IPlanProvider;
   /** Visual inference timeout in milliseconds. */
   visionTimeoutMs?: number;
   /** Maximum recovery operations per task. */
@@ -178,7 +187,7 @@ export class ExecutionEngine implements IExecutionEngine {
     }
     this.active.add(task.id);
 
-    const steps = normalizePlan(rawPlan);
+    let steps = normalizePlan(rawPlan);
     const taskOrigins = (task.approvedOrigins && task.approvedOrigins.length)
       ? normalizeOrigins(task.approvedOrigins)
       : [];
@@ -345,7 +354,10 @@ export class ExecutionEngine implements IExecutionEngine {
       const actionTimeoutMs = this.options.actionTimeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS;
       const taskTimeoutMs = this.options.taskTimeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
 
-      for (let index = startIndex; index < steps.length; index += 1) {
+      let index = startIndex;
+      let replanCount = 0;
+      const MAX_REPLANS = 2;
+      while (index < steps.length) {
         const step = steps[index]!;
 
         // 1. Task status / cancellation check against persisted state.
@@ -626,6 +638,32 @@ export class ExecutionEngine implements IExecutionEngine {
             return { status: 'completed', executedActions: recovery.executedActions };
           }
           if (recovery.kind === 'exhausted') {
+            if (this.options.planner && replanCount < MAX_REPLANS) {
+              replanCount += 1;
+              let pageState = '';
+              try { pageState = await this.capturePageState(activePage); } catch { pageState = ''; }
+              await this.createEvent(task.id, 'PLANNING_STARTED', { replan: true, iteration: replanCount });
+              try {
+                const r = await this.options.planner.plan(
+                  { objective: task.objective, observations: [pageState], approvedOrigins: taskOrigins, priorActions: [] },
+                  { requestId: task.id }
+                );
+                const newSteps = normalizePlan(r.plan);
+                if (newSteps.length > 0) {
+                  const newSig = JSON.stringify(newSteps.map((s: any) => s.action.type + ':' + (s.action.payload?.url ?? '')));
+                  const oldSig = JSON.stringify(steps.map((s: any) => s.action.type + ':' + (s.action.payload?.url ?? '')));
+                  if (newSig !== oldSig) {
+                    steps = newSteps;
+                    index = 0;
+                    task.currentStepIndex = 0;
+                    await this.taskRepo.update(task.id, { currentStepIndex: 0 });
+                    continue;
+                  }
+                }
+              } catch {
+                // fall through
+              }
+            }
             throw new VerificationError(finalVerification.detail, finalVerification.outcome);
           }
           // recovery.kind === 'continue' means a bounded recovery retry of this
@@ -638,6 +676,7 @@ export class ExecutionEngine implements IExecutionEngine {
         }
         await this.taskRepo.update(task.id, { currentStepIndex: index + 1 });
         task.currentStepIndex = index + 1;
+        index += 1;
       }
 
       await this.taskRepo.update(task.id, { status: 'VERIFYING' });
@@ -1072,6 +1111,14 @@ export class ExecutionEngine implements IExecutionEngine {
     // the origin or action schema.
     const revalidated = this.policy.evaluate(action);
     return revalidated.allowed;
+  }
+
+  private async capturePageState(page: Page): Promise<string> {
+    const url = page.url();
+    const title = await page.title().catch(() => '');
+    const text = await page.innerText('body').catch(() => '');
+    const bounded = text.replace(/\s+/g, ' ').trim().slice(0, 2000);
+    return `URL: ${url}\nTitle: ${title}\nText: ${bounded}`;
   }
 
   private async handleFailure(

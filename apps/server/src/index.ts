@@ -4,6 +4,8 @@ import {
   ApprovalRepository,
   EvidenceRepository,
   TaskRepository,
+  SkillRepository,
+  SkillRunRepository,
 } from '@ghost/storage';
 import { ExecutionEngine } from '@ghost/engine';
 import {
@@ -78,6 +80,7 @@ async function main(): Promise<void> {
     {
       policy,
       allowedOrigins: config.approvedOrigins,
+      planner: planner as any,
       approvalRepo,
       taskTimeoutMs: config.executionTimeoutMs,
       actionTimeoutMs: config.actionTimeoutMs,
@@ -90,6 +93,8 @@ async function main(): Promise<void> {
     }
   );
 
+  const skillRepo = new SkillRepository(prisma);
+  const skillRunRepo = new SkillRunRepository(prisma);
   const taskService = new TaskService({
     taskRepo,
     approvalRepo,
@@ -98,6 +103,7 @@ async function main(): Promise<void> {
     policy,
     plannerModel: config.plannerModel,
     approvedOrigins: config.approvedOrigins,
+    skillRunRepo,
     observationProvider: () => collectPageObservation(config.allowedOrigin),
   });
 
@@ -157,7 +163,7 @@ async function main(): Promise<void> {
     return value;
   };
 
-  const app = await createApp({ config, taskService, getModelHealth });
+  const app = await createApp({ config, taskService, getModelHealth, skillRepo, skillRunRepo });
 
   const shutdown = async () => {
     provider.cancelAll();

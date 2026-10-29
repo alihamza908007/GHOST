@@ -11,6 +11,9 @@ const schemaSql = [
     "planSummary" TEXT,
     "plannerModel" TEXT,
     "approvedOriginsJson" TEXT,
+    "researchFieldsJson" TEXT,
+    "researchBudget" INTEGER,
+    "researchResultJson" TEXT,
     "error" TEXT,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL
@@ -43,6 +46,25 @@ const schemaSql = [
     "size" INTEGER NOT NULL,
     "timestamp" BIGINT NOT NULL,
     CONSTRAINT "Evidence_taskId_fkey" FOREIGN KEY ("taskId") REFERENCES "Task" ("id") ON DELETE RESTRICT ON UPDATE CASCADE
+  )`,
+  `CREATE TABLE "Skill" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "name" TEXT NOT NULL,
+    "version" INTEGER NOT NULL DEFAULT 1,
+    "definitionJson" TEXT NOT NULL,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL
+  )`,
+  `CREATE TABLE "SkillRun" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "skillId" TEXT NOT NULL,
+    "skillVersion" INTEGER NOT NULL,
+    "taskId" TEXT,
+    "inputsJson" TEXT NOT NULL,
+    "status" TEXT NOT NULL,
+    "error" TEXT,
+    "startedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "completedAt" DATETIME
   )`,
 ];
 

@@ -43,6 +43,9 @@ export interface Task {
   plannerModel?: string | null;
   /** Approved origins for this task (multi-origin). */
   approvedOrigins?: string[] | null;
+  researchFields?: Array<{ name: string; type: string; description?: string }> | null;
+  researchBudget?: number | null;
+  researchResultJson?: string | null;
   /** Safe, user-facing failure reason. Never contains prompts or secrets. */
   error?: string | null;
   createdAt?: number;
@@ -197,4 +200,26 @@ export interface VisualObserverLike {
   readonly name: string;
   readonly model: string;
   observe(input: VisualObservationInput): Promise<VisualObservation>;
+}
+
+export interface SkillInput {
+  name: string;
+  description: string;
+}
+
+export interface SkillDefinition {
+  id: string;
+  name: string;
+  description: string;
+  version: number;
+  inputs: SkillInput[];
+  steps: Array<{
+    action: any;
+    description: string;
+    expectation: any;
+  }>;
+  preconditions?: string;
+  postconditions?: string;
+  verificationStrategy?: string;
+  createdAt?: number;
 }
