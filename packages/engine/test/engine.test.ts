@@ -26,12 +26,13 @@ function evidenceRepoMock(): IEvidenceRepository {
   };
 }
 
-const baseTask = (id = 'task-sec-1'): Task => ({
+const baseTask = (id = 'task-sec-1', origin = 'http://127.0.0.1:3001'): Task => ({
   id,
   objective: 'Try navigating to forbidden origin',
   status: 'IDLE',
   currentStepIndex: 0,
   lastEventId: null,
+  approvedOrigins: [origin],
 });
 
 function recordedEvents(repo: ITaskRepository): Array<{
@@ -82,7 +83,7 @@ describe('@ghost/engine security boundary', () => {
       'http://127.0.0.1:3001',
       '/tmp'
     );
-    const task = baseTask('task-budget');
+    const task = baseTask('task-budget', 'http://127.0.0.1:3001');
     const steps = [
       {
         action: { type: 'NAVIGATE' as const, payload: { url: 'http://127.0.0.1:3001/' } },
@@ -114,7 +115,7 @@ describe('@ghost/engine security boundary', () => {
       'http://127.0.0.1:3001',
       '/tmp'
     );
-    const task = baseTask('task-duplicate');
+    const task = baseTask('task-duplicate', 'http://127.0.0.1:3001');
     const plan = [
       { type: 'NAVIGATE' as const, payload: { url: 'https://evil.com/phish' } },
     ];
@@ -148,7 +149,7 @@ describe('@ghost/engine security boundary', () => {
       '/tmp',
       { policy: policy as never, actionTimeoutMs: 500, taskTimeoutMs: 5_000 }
     );
-    const task = baseTask('task-approval');
+    const task = baseTask('task-approval', 'http://127.0.0.1:3001');
     const steps = [
       {
         action: { type: 'NAVIGATE' as const, payload: { url: 'http://127.0.0.1:3001/' } },
@@ -201,7 +202,7 @@ describe('@ghost/engine security boundary', () => {
       actionTimeoutMs: 5_000,
       taskTimeoutMs: 10_000,
     });
-    const task = baseTask('task-per-action');
+    const task = baseTask('task-per-action', origin);
     const steps = [
       {
         action: { type: 'NAVIGATE' as const, payload: { url: `${origin}/` } },
@@ -246,7 +247,7 @@ describe('@ghost/engine security boundary', () => {
       actionTimeoutMs: 5_000,
       taskTimeoutMs: 10_000,
     });
-    const task = baseTask('task-redirect');
+    const task = baseTask('task-redirect', origin);
     const steps = [
       {
         action: { type: 'NAVIGATE' as const, payload: { url: `${origin}/redirect` } },
@@ -280,7 +281,7 @@ describe('@ghost/engine security boundary', () => {
       actionTimeoutMs: 5_000,
       taskTimeoutMs: 10_000,
     });
-    const task = baseTask('task-popup');
+    const task = baseTask('task-popup', origin);
     const steps = [
       {
         action: { type: 'NAVIGATE' as const, payload: { url: `${origin}/` } },

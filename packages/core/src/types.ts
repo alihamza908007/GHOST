@@ -41,6 +41,8 @@ export interface Task {
   plan?: Plan | null;
   planSummary?: string | null;
   plannerModel?: string | null;
+  /** Approved origins for this task (multi-origin). */
+  approvedOrigins?: string[] | null;
   /** Safe, user-facing failure reason. Never contains prompts or secrets. */
   error?: string | null;
   createdAt?: number;
@@ -57,6 +59,7 @@ export type TaskEventType =
   | 'ACTION_FINISHED'
   | 'VERIFICATION_RESULT'
   | 'VISUAL_OBSERVATION_STARTED'
+  | 'ORIGIN_TRANSITION'
   | 'VISUAL_OBSERVATION_COMPLETED'
   | 'VISUAL_UNAVAILABLE'
   | 'DOM_VISUAL_DISAGREEMENT'

@@ -10,6 +10,7 @@ const schemaSql = [
     "planJson" TEXT,
     "planSummary" TEXT,
     "plannerModel" TEXT,
+    "approvedOriginsJson" TEXT,
     "error" TEXT,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL

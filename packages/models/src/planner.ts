@@ -95,6 +95,7 @@ export class StructuredPlanner {
       attempts = attempt;
       const prompt = buildPlanningPrompt(context, {
         allowedOrigin: this.policy.allowedOrigin,
+        allowedOrigins: this.policy.allowedOrigins,
         correction,
       });
 

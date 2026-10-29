@@ -16,6 +16,8 @@ import {
   actionsEqual,
   isTerminalStatus,
   resolveContainedEvidencePath,
+  normalizeOrigins,
+  normalizeOrigin,
 } from '@ghost/core';
 import { IApprovalRepository, IEvidenceRepository, ITaskRepository } from '@ghost/storage';
 import { Browser, BrowserContext, chromium, Page } from 'playwright';
@@ -76,6 +78,8 @@ export interface ExecutionEngineOptions {
   maxRetriesPerAction?: number;
   /** Allowlisted semantic close-control names for overlay dismissal. */
   recoveryCloseAllowlist?: string[];
+  /** Approved origins for this task/engine (multi-origin). */
+  allowedOrigins?: string[];
   /** Whether screenshots are redacted for sensitive inputs before persistence. Defaults to true. */
   redactScreenshots?: boolean;
 }
@@ -108,6 +112,7 @@ export class ExecutionEngine implements IExecutionEngine {
   private readonly active = new Set<string>();
   private readonly pausedSessions = new Map<string, PausedSession>();
   private readonly lastVisual = new Map<string, VisualEvaluation>();
+  private allowedOrigins: string[] = [];
   private readonly lastVerification = new Map<string, VerificationResult>();
   private readonly recoveryCounts = new Map<string, number>();
   private readonly retryCounts = new Map<string, number>();
@@ -120,10 +125,16 @@ export class ExecutionEngine implements IExecutionEngine {
     private options: ExecutionEngineOptions = {}
   ) {
     this.tools = options.tools ?? new BrowserToolRegistry();
+    this.allowedOrigins = normalizeOrigins([
+      ...(options.allowedOrigins ?? []),
+      ...(options.policy?.allowedOrigins ?? []),
+      allowedOrigin,
+    ]);
+    if (this.allowedOrigins.length === 0) this.allowedOrigins = [allowedOrigin];
   }
 
   private get policy(): ActionPolicy {
-    return this.options.policy ?? new ActionPolicy({ allowedOrigin: this.allowedOrigin });
+    return this.options.policy ?? new ActionPolicy({ allowedOrigins: this.allowedOrigins });
   }
 
   private get maxActions(): number {
@@ -168,6 +179,13 @@ export class ExecutionEngine implements IExecutionEngine {
     this.active.add(task.id);
 
     const steps = normalizePlan(rawPlan);
+    const taskOrigins = (task.approvedOrigins && task.approvedOrigins.length)
+      ? normalizeOrigins(task.approvedOrigins)
+      : [];
+    if (taskOrigins.length === 0) {
+      throw new PolicyViolationError('INVALID_ACTION', 'Task has no approved origin authorization snapshot');
+    }
+    let currentOrigin = taskOrigins[0];
     const startIndex = options.startIndex ?? 0;
     let executedActions = startIndex;
 
@@ -283,7 +301,9 @@ export class ExecutionEngine implements IExecutionEngine {
             return !isDocument;
           }
           try {
-            return new URL(rawUrl).origin === this.allowedOrigin;
+            let requestOrigin: string;
+          try { requestOrigin = new URL(rawUrl).origin; } catch { return false; }
+          return taskOrigins.includes(requestOrigin) || taskOrigins.includes(normalizeOrigin(requestOrigin) ?? requestOrigin);
           } catch {
             return false;
           }
@@ -429,7 +449,8 @@ export class ExecutionEngine implements IExecutionEngine {
         // typed tool. A click expectation that already held before the click
         // cannot be used as proof afterwards.
         const baseVerificationContext: VerificationContext = {
-          allowedOrigin: this.allowedOrigin,
+          allowedOrigin: taskOrigins[0],
+          allowedOrigins: taskOrigins,
           taskId: task.id,
           evidenceDir: this.evidenceDir,
           fileExists: (filename) => this.evidenceRepo.exists(filename),
@@ -507,6 +528,14 @@ export class ExecutionEngine implements IExecutionEngine {
             ? { screenshot: toolResult.evidenceFilename }
             : {}),
         });
+        if (action.type === 'NAVIGATE') {
+          await this.createEvent(task.id, 'ORIGIN_TRANSITION', {
+            stepIndex: index,
+            from: currentOrigin,
+            to: new URL(action.payload.url).origin,
+            authorized: true,
+          });
+        }
 
         if (toolResult.evidenceFilename) {
           await this.evidenceRepo.save({
@@ -592,7 +621,7 @@ export class ExecutionEngine implements IExecutionEngine {
         });
 
         if (finalVerification.outcome !== 'passed') {
-          const recovery = await this.runRecovery(task, steps, executedActions, activePage, state, index, finalVerification, startedAt);
+          const recovery = await this.runRecovery(task, steps, executedActions, activePage, state, index, finalVerification, startedAt, taskOrigins);
           if (recovery.kind === 'completed') {
             return { status: 'completed', executedActions: recovery.executedActions };
           }
@@ -604,6 +633,9 @@ export class ExecutionEngine implements IExecutionEngine {
         }
 
         // 8. Persist progress.
+        if (action.type === 'NAVIGATE') {
+          try { currentOrigin = new URL(action.payload.url).origin; } catch { /* keep */ }
+        }
         await this.taskRepo.update(task.id, { currentStepIndex: index + 1 });
         task.currentStepIndex = index + 1;
       }
@@ -673,7 +705,8 @@ export class ExecutionEngine implements IExecutionEngine {
     state: BrowserSessionState,
     failedStepIndex: number,
     verification: VerificationResult,
-    taskStartedAt: number
+    taskStartedAt: number,
+    allowedOrigins: string[] = this.allowedOrigins
   ): Promise<{ kind: 'completed' | 'continue' | 'exhausted'; executedActions: number }> {
     const taskId = task.id;
     let taskStatus: TaskStatus = task.status;
@@ -699,7 +732,8 @@ export class ExecutionEngine implements IExecutionEngine {
         verification: currentVerification,
         visual: currentVisual,
         policy: this.policy,
-        allowedOrigin: this.allowedOrigin,
+        allowedOrigin: allowedOrigins[0],
+        allowedOrigins: allowedOrigins,
         recoveryCloseAllowlist: this.recoveryCloseAllowlist,
         recoveryAttemptsUsed: attemptsUsed,
         retriesForAction: this.retryCounts.get(taskId) ?? 0,
@@ -816,7 +850,8 @@ export class ExecutionEngine implements IExecutionEngine {
         }
 
         const context: VerificationContext = {
-          allowedOrigin: this.allowedOrigin,
+          allowedOrigin: allowedOrigins[0],
+          allowedOrigins: allowedOrigins,
           taskId,
           evidenceDir: this.evidenceDir,
           fileExists: (filename) => this.evidenceRepo.exists(filename),

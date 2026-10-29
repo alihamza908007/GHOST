@@ -61,6 +61,7 @@ interface Task {
   currentStepIndex: number;
   currentStep?: number;
   plan: Plan | null;
+  approvedOrigins?: string[] | null;
   planSummary?: string | null;
   plannerModel?: string | null;
   error?: string | null;
@@ -242,6 +243,14 @@ function eventSummary(event: TaskEvent): { title: string; detail?: string; tone:
         detail: detailValue,
         tone: 'text-red-400',
       };
+    case 'ORIGIN_TRANSITION':
+      return {
+        title: 'Origin transition',
+        detail: `${String(data.from ?? '')} → ${String(data.to ?? '')}${
+          data.authorized === false ? ' (rejected)' : ''
+        }`,
+        tone: data.authorized === false ? 'text-red-400' : 'text-blue-400',
+      };
     case 'TASK_CANCELLED':
       return { title: 'Task cancelled', detail: detailValue, tone: 'text-zinc-400' };
     case 'TASK_COMPLETED':
@@ -259,6 +268,7 @@ export default function Dashboard() {
   const [objective, setObjective] = useState(
     'Open the GHOST demo application, fill the Email field with demo@example.com, click Sign in, and capture a screenshot.'
   );
+  const [approvedOrigins, setApprovedOrigins] = useState('');
   const [tasks, setTasks] = useState<Task[]>([]);
   const [task, setTask] = useState<Task | null>(null);
   const [events, setEvents] = useState<TaskEvent[]>([]);
@@ -364,7 +374,13 @@ export default function Dashboard() {
       const res = await fetch(`${API}/tasks/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ objective: finalObjective }),
+        body: JSON.stringify({
+          objective: finalObjective,
+          approvedOrigins: approvedOrigins
+            .split(',')
+            .map((item) => item.trim())
+            .filter(Boolean),
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Unable to start task');
@@ -459,6 +475,15 @@ export default function Dashboard() {
             />
             <div className="flex items-center justify-between mt-3 gap-3">
               <span className="text-[11px] text-zinc-600">{objective.length}/1000</span>
+              <label className="text-[11px] text-zinc-600 block mb-1">Approved origins (comma-separated, optional)</label>
+              <input
+                value={approvedOrigins}
+                onChange={(event) => setApprovedOrigins(event.target.value)}
+                placeholder="http://127.0.0.1:3001"
+                className="w-full bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200 outline-none focus:border-zinc-600"
+              />
+            </div>
+            <div className="flex items-center justify-end mt-3">
               <button
                 onClick={() => void startTask()}
                 disabled={isStarting || !objective.trim()}
@@ -596,6 +621,11 @@ export default function Dashboard() {
                 <p className="text-sm text-zinc-300 mt-4">{task.objective}</p>
                 {task.planSummary && (
                   <p className="text-xs text-zinc-500 mt-1">{task.planSummary}</p>
+                )}
+                {task.approvedOrigins && task.approvedOrigins.length > 0 && (
+                  <p className="text-xs text-zinc-500 mt-1">
+                    Approved origins: {task.approvedOrigins.join(', ')}
+                  </p>
                 )}
               </div>
 

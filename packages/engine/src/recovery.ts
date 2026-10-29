@@ -21,6 +21,7 @@ export interface RecoveryEvaluationInput {
   visual: VisualEvaluation;
   policy: ActionPolicy;
   allowedOrigin: string;
+  allowedOrigins?: string[];
   recoveryCloseAllowlist: string[];
   recoveryAttemptsUsed: number;
   retriesForAction: number;
@@ -98,7 +99,7 @@ export function evaluateRecovery(input: RecoveryEvaluationInput): RecoveryDecisi
   if (obstructionJustified && dismissLocator) {
     const auth = input.policy.authorizeRecovery(
       { kind: 'DISMISS_OVERLAY', locator: dismissLocator },
-      { allowedOrigin: input.allowedOrigin, recoveryCloseAllowlist: input.recoveryCloseAllowlist }
+      { allowedOrigins: input.allowedOrigins ?? [input.allowedOrigin], recoveryCloseAllowlist: input.recoveryCloseAllowlist }
     );
     if (auth.allowed) {
       decision.allowed = true;

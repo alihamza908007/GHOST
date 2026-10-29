@@ -114,7 +114,7 @@ export function normalizeOrigins(values: Array<string | null | undefined>): stri
 }
 
 export function isAllowedUrl(url: string, allowedOrigins: string | string[]): boolean {
-  const set = Array.isArray(allowedOrigins) ? allowedOrigins : [allowedOrigins];
+  const set = normalizeOrigins(Array.isArray(allowedOrigins) ? allowedOrigins : [allowedOrigins]);
   try {
     const parsed = new URL(url);
     if (parsed.username || parsed.password) return false;

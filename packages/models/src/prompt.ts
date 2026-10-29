@@ -3,6 +3,8 @@ import type { VisualCondition } from '@ghost/core';
 
 export interface PlanningContext {
   objective: string;
+  /** Approved origins for this task. The planner may only propose navigations within this set. */
+  approvedOrigins?: string[];
   /**
    * Untrusted page observations. They are delimited and labelled as data; any
    * instructions inside them are never treated as planner instructions.
@@ -224,13 +226,14 @@ export function buildPlanJsonSchema(): Record<string, unknown> {
 
 export function buildPlanningPrompt(
   context: PlanningContext,
-  options: { allowedOrigin: string; correction?: string }
+  options: { allowedOrigin?: string; allowedOrigins?: string[]; correction?: string }
 ): BuiltPlanningPrompt {
   const system = [
     "You are GHOST's planning component.",
     'You propose a bounded browser plan as JSON. You never execute code and have no browser access.',
     'The runtime independently validates every step with Zod and authorizes it with a deterministic policy before execution.',
-    `The only permitted origin is ${options.allowedOrigin} (exact scheme, host and port).`,
+    `The approved origins are: ${(options.allowedOrigins && options.allowedOrigins.length ? options.allowedOrigins : [options.allowedOrigin ?? '']).join(', ')} (exact scheme, host and port).`,
+    'You may only NAVIGATE to one of the approved origins. Never invent or request additional origins.',
     'Allowed actions:',
     '- NAVIGATE: {"type":"NAVIGATE","payload":{"url":"<approved origin URL>"}}',
     '- CLICK: {"type":"CLICK","payload":{"locator":{"by":"role","role":"button","name":"Sign in"}}}',

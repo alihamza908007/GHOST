@@ -9,6 +9,7 @@ import {
   TaskStatus,
   isSafeEvidenceFilename,
   resolveContainedEvidencePath,
+  normalizeOrigins,
 } from '@ghost/core';
 import { PrismaClient } from '@prisma/client';
 import path from 'path';
@@ -87,6 +88,17 @@ function mapTask(task: any): Task {
     plan: parsePlan(task.planJson),
     planSummary: task.planSummary,
     plannerModel: task.plannerModel,
+    approvedOrigins: (() => {
+      if (!task.approvedOriginsJson) return task.approvedOrigins ?? null;
+      try {
+        const parsed = JSON.parse(task.approvedOriginsJson);
+        if (!Array.isArray(parsed)) return null;
+        const normalized = normalizeOrigins(parsed.map((x: unknown) => (typeof x === 'string' ? x : null)));
+        return normalized.length > 0 ? normalized : null;
+      } catch {
+        return null;
+      }
+    })(),
     error: task.error,
     // Tolerate legacy TEXT datetimes as well as Prisma's INTEGER epoch ms.
     createdAt: toEpoch(task.createdAt),
@@ -112,6 +124,7 @@ export class TaskRepository implements ITaskRepository {
         planJson: task.plan ? JSON.stringify(task.plan) : null,
         planSummary: task.planSummary ?? null,
         plannerModel: task.plannerModel ?? null,
+        approvedOriginsJson: task.approvedOrigins ? JSON.stringify(task.approvedOrigins) : null,
         error: task.error ?? null,
       },
     });
@@ -125,6 +138,7 @@ export class TaskRepository implements ITaskRepository {
     if (updates.plan !== undefined) data.planJson = updates.plan ? JSON.stringify(updates.plan) : null;
     if (updates.planSummary !== undefined) data.planSummary = updates.planSummary;
     if (updates.plannerModel !== undefined) data.plannerModel = updates.plannerModel;
+    if (updates.approvedOrigins !== undefined) data.approvedOriginsJson = updates.approvedOrigins ? JSON.stringify(updates.approvedOrigins) : null;
     if (updates.error !== undefined) data.error = updates.error;
 
     if (Object.keys(data).length === 0) return;

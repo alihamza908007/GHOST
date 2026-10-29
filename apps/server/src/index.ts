@@ -57,7 +57,7 @@ async function main(): Promise<void> {
   const approvalRepo = new ApprovalRepository(prisma);
   const evidenceRepo = new EvidenceRepository(config.evidenceDir, prisma);
 
-  const policy = new ActionPolicy({ allowedOrigin: config.allowedOrigin });
+  const policy = new ActionPolicy({ allowedOrigin: config.allowedOrigin, allowedOrigins: config.approvedOrigins });
   const provider = new OllamaProvider({
     baseUrl: config.ollamaBaseUrl,
     model: config.plannerModel,
@@ -77,6 +77,7 @@ async function main(): Promise<void> {
     config.evidenceDir,
     {
       policy,
+      allowedOrigins: config.approvedOrigins,
       approvalRepo,
       taskTimeoutMs: config.executionTimeoutMs,
       actionTimeoutMs: config.actionTimeoutMs,
@@ -96,6 +97,7 @@ async function main(): Promise<void> {
     engine,
     policy,
     plannerModel: config.plannerModel,
+    approvedOrigins: config.approvedOrigins,
     observationProvider: () => collectPageObservation(config.allowedOrigin),
   });
 

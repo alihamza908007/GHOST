@@ -3,6 +3,7 @@ import type { Locator as PlaywrightLocator, Page } from 'playwright';
 
 export interface VerificationContext {
   allowedOrigin: string;
+  allowedOrigins?: string[];
   taskId: string;
   evidenceDir: string;
   timeoutMs?: number;
@@ -55,7 +56,7 @@ async function checkExpectation(
 
   if (expectation.kind === 'url') {
     const current = page.url();
-    if (!isAllowedUrl(current, context.allowedOrigin)) {
+    if (!isAllowedUrl(current, context.allowedOrigins ?? context.allowedOrigin)) {
       return {
         outcome: 'failed',
         method: 'url-origin',
@@ -221,7 +222,7 @@ export async function verifyAction(
   const timestamp = Date.now();
 
   if (action.type === 'NAVIGATE') {
-    if (!isAllowedUrl(page.url(), context.allowedOrigin)) {
+    if (!isAllowedUrl(page.url(), context.allowedOrigins ?? context.allowedOrigin)) {
       return {
         outcome: 'failed',
         method: 'navigation-origin',

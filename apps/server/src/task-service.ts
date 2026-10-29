@@ -9,6 +9,8 @@ import {
   TaskEventType,
   actionsEqual,
   isTerminalStatus,
+  normalizeOrigins,
+  normalizeOrigin,
 } from '@ghost/core';
 import { IApprovalRepository, ITaskRepository } from '@ghost/storage';
 import {
@@ -57,6 +59,7 @@ export interface TaskServiceOptions {
   engine: EngineLike;
   policy: ActionPolicy;
   plannerModel: string;
+  approvedOrigins?: string[];
   observationProvider?: () => Promise<string[]>;
 }
 
@@ -67,6 +70,7 @@ export class TaskService {
   private readonly engine: EngineLike;
   private readonly policy: ActionPolicy;
   private readonly plannerModel: string;
+  private readonly approvedOrigins?: string[];
   private readonly observationProvider?: () => Promise<string[]>;
   private readonly active = new Set<string>();
   private readonly aborts = new Map<string, AbortController>();
@@ -78,10 +82,11 @@ export class TaskService {
     this.engine = options.engine;
     this.policy = options.policy;
     this.plannerModel = options.plannerModel;
+    this.approvedOrigins = options.approvedOrigins ?? this.policy.allowedOrigins;
     this.observationProvider = options.observationProvider;
   }
 
-  async startTask(objective: string): Promise<Task> {
+  async startTask(objective: string, approvedOrigins?: string[]): Promise<Task> {
     const cleaned = objective.trim();
     if (cleaned.length === 0) {
       throw new ServiceError('INVALID_OBJECTIVE', 'An objective is required');
@@ -93,10 +98,23 @@ export class TaskService {
       );
     }
 
+    const requested = approvedOrigins && approvedOrigins.length > 0 ? approvedOrigins : (this.approvedOrigins ?? this.policy.allowedOrigins);
+    // Strict: every supplied origin must normalize successfully; no silent dropping.
+    for (const o of requested) {
+      if (normalizeOrigin(o) === null) {
+        throw new ServiceError('INVALID_ORIGIN', `Invalid approved origin: ${o}`, 400);
+      }
+    }
+    const normalizedOrigins = normalizeOrigins(requested);
+    if (normalizedOrigins.length === 0) {
+      throw new ServiceError('INVALID_ORIGIN', 'At least one valid approved origin is required', 400);
+    }
+
     const task: Task = {
       id: crypto.randomUUID(),
       objective: cleaned,
       status: 'PLANNING',
+      approvedOrigins: normalizedOrigins,
       currentStepIndex: 0,
       lastEventId: null,
       plan: null,
@@ -128,6 +146,22 @@ export class TaskService {
         return null;
       }
 
+      // Authorization must already be persisted on the task. Never create or
+      // widen it during execution. Missing/invalid authorization fails closed.
+      const normalized = normalizeOrigins(fresh.approvedOrigins ?? []);
+      if (normalized.length === 0) {
+        await this.taskRepo.update(task.id, {
+          status: 'FAILED',
+          error: 'Task authorization snapshot is missing or invalid; reauthorization required.',
+        });
+        await this.createEvent(task.id, 'ERROR', {
+          code: 'AUTHORIZATION_MISSING',
+          message: 'Task authorization snapshot is missing or invalid; reauthorization required.',
+        });
+        return { status: 'failed', error: 'Task authorization snapshot is missing or invalid', executedActions: 0 };
+      }
+      fresh.approvedOrigins = normalized;
+
       await this.createEvent(task.id, 'PLANNING_STARTED', {
         model: this.plannerModel,
         maxSteps: LIMITS.MAX_PLAN_STEPS,
@@ -140,6 +174,7 @@ export class TaskService {
         {
           objective: fresh.objective,
           observations,
+          approvedOrigins: fresh.approvedOrigins ?? this.policy.allowedOrigins,
         },
         { requestId: task.id, signal: abort.signal }
       );

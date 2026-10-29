@@ -19,6 +19,7 @@ export interface AppDependencies {
 const StartBodySchema = z
   .object({
     objective: z.string().optional(),
+    approvedOrigins: z.array(z.string()).optional(),
   })
   .strict();
 
@@ -125,7 +126,7 @@ export async function createApp(
     const objective =
       parsed.data.objective ?? 'Open the GHOST demo application and capture a screenshot.';
     try {
-      const task = await taskService.startTask(objective);
+      const task = await taskService.startTask(objective, parsed.data.approvedOrigins);
       return reply.code(202).send({ taskId: task.id, task: publicTask(task) });
     } catch (error) {
       return sendServiceError(reply, error);

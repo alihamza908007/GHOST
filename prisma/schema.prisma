@@ -16,6 +16,7 @@ model Task {
   planJson         String?
   planSummary      String?
   plannerModel     String?
+  approvedOriginsJson String?
   error            String?
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @default(now()) @updatedAt

@@ -94,6 +94,7 @@ function configFor(evidenceDir: string): GhostConfig {
     evidenceDir,
     modelProbeCacheMs: 1_000,
     redactScreenshots: true,
+    approvedOrigins: [origin],
   };
 }
 
