@@ -7,6 +7,9 @@ import {
   TaskEvent,
   TaskEventType,
   TaskStatus,
+  isSafeEvidenceFilename,
+  resolveContainedEvidencePath,
+  normalizeOrigins,
 } from '@ghost/core';
 import { PrismaClient } from '@prisma/client';
 import path from 'path';
@@ -85,6 +88,20 @@ function mapTask(task: any): Task {
     plan: parsePlan(task.planJson),
     planSummary: task.planSummary,
     plannerModel: task.plannerModel,
+    researchFields: task.researchFieldsJson ? JSON.parse(task.researchFieldsJson) : null,
+    researchBudget: task.researchBudget ?? null,
+    researchResultJson: task.researchResultJson ?? null,
+    approvedOrigins: (() => {
+      if (!task.approvedOriginsJson) return task.approvedOrigins ?? null;
+      try {
+        const parsed = JSON.parse(task.approvedOriginsJson);
+        if (!Array.isArray(parsed)) return null;
+        const normalized = normalizeOrigins(parsed.map((x: unknown) => (typeof x === 'string' ? x : null)));
+        return normalized.length > 0 ? normalized : null;
+      } catch {
+        return null;
+      }
+    })(),
     error: task.error,
     // Tolerate legacy TEXT datetimes as well as Prisma's INTEGER epoch ms.
     createdAt: toEpoch(task.createdAt),
@@ -110,6 +127,10 @@ export class TaskRepository implements ITaskRepository {
         planJson: task.plan ? JSON.stringify(task.plan) : null,
         planSummary: task.planSummary ?? null,
         plannerModel: task.plannerModel ?? null,
+        approvedOriginsJson: task.approvedOrigins ? JSON.stringify(task.approvedOrigins) : null,
+        researchFieldsJson: task.researchFields ? JSON.stringify(task.researchFields) : null,
+        researchBudget: task.researchBudget ?? null,
+        researchResultJson: task.researchResultJson ?? null,
         error: task.error ?? null,
       },
     });
@@ -123,6 +144,10 @@ export class TaskRepository implements ITaskRepository {
     if (updates.plan !== undefined) data.planJson = updates.plan ? JSON.stringify(updates.plan) : null;
     if (updates.planSummary !== undefined) data.planSummary = updates.planSummary;
     if (updates.plannerModel !== undefined) data.plannerModel = updates.plannerModel;
+    if (updates.approvedOrigins !== undefined) data.approvedOriginsJson = updates.approvedOrigins ? JSON.stringify(updates.approvedOrigins) : null;
+    if (updates.researchFields !== undefined) data.researchFieldsJson = updates.researchFields ? JSON.stringify(updates.researchFields) : null;
+    if (updates.researchBudget !== undefined) data.researchBudget = updates.researchBudget;
+    if (updates.researchResultJson !== undefined) data.researchResultJson = updates.researchResultJson;
     if (updates.error !== undefined) data.error = updates.error;
 
     if (Object.keys(data).length === 0) return;
@@ -189,7 +214,7 @@ export class TaskRepository implements ITaskRepository {
     const interrupted = await this.prisma.task.findMany({
       where: {
         status: {
-          in: ['PLANNING', 'PLAN_READY', 'EXECUTING', 'VERIFYING', 'AWAITING_APPROVAL'],
+          in: ['PLANNING', 'PLAN_READY', 'EXECUTING', 'VERIFYING', 'RETRYING', 'AWAITING_APPROVAL'],
         },
       },
     });
@@ -304,6 +329,9 @@ export class EvidenceRepository implements IEvidenceRepository {
     timestamp: number;
     size?: number;
   }): Promise<void> {
+    if (!isSafeEvidenceFilename(evidence.filename)) {
+      throw new Error('Unsafe evidence filename');
+    }
     if (!this.prisma) return;
     const size = evidence.size ?? this.size(evidence.filename);
     await this.prisma.evidence.create({
@@ -319,11 +347,15 @@ export class EvidenceRepository implements IEvidenceRepository {
   }
 
   getFilePath(filename: string): string {
-    return path.resolve(this.baseDir, filename);
+    return resolveContainedEvidencePath(this.baseDir, filename);
   }
 
   exists(filename: string): boolean {
-    return fs.existsSync(this.getFilePath(filename));
+    try {
+      return fs.existsSync(this.getFilePath(filename));
+    } catch {
+      return false;
+    }
   }
 
   size(filename: string): number {
@@ -332,5 +364,87 @@ export class EvidenceRepository implements IEvidenceRepository {
     } catch {
       return 0;
     }
+  }
+}
+
+
+export class SkillRepository {
+  constructor(private prisma: PrismaClient) {}
+
+  async save(skill: { id: string; name: string; version?: number; definition: any }): Promise<void> {
+    await this.prisma.skill.upsert({
+      where: { id: skill.id },
+      create: {
+        id: skill.id,
+        name: skill.name,
+        version: skill.version ?? 1,
+        definitionJson: JSON.stringify(skill.definition),
+      },
+      update: {
+        name: skill.name,
+        version: skill.version ?? 1,
+        definitionJson: JSON.stringify(skill.definition),
+      },
+    });
+  }
+
+  async list(): Promise<Array<{ id: string; name: string; version: number; definition: any }>> {
+    const rows = await this.prisma.skill.findMany({ orderBy: { createdAt: 'desc' } });
+    return rows.map((r: any) => ({
+      id: r.id,
+      name: r.name,
+      version: r.version,
+      definition: JSON.parse(r.definitionJson),
+    }));
+  }
+
+  async get(id: string): Promise<{ id: string; name: string; version: number; definition: any } | null> {
+    const r = await this.prisma.skill.findUnique({ where: { id } });
+    if (!r) return null;
+    return { id: r.id, name: r.name, version: r.version, definition: JSON.parse(r.definitionJson) };
+  }
+}
+
+
+export class SkillRunRepository {
+  constructor(private prisma: PrismaClient) {}
+
+  async create(run: { id: string; skillId: string; skillVersion: number; taskId?: string | null; inputs: Record<string, unknown> }): Promise<void> {
+    await this.prisma.skillRun.create({
+      data: {
+        id: run.id,
+        skillId: run.skillId,
+        skillVersion: run.skillVersion,
+        taskId: run.taskId ?? null,
+        inputsJson: JSON.stringify(run.inputs),
+        status: 'RUNNING',
+      },
+    });
+  }
+
+  async complete(id: string, status: string, error?: string): Promise<void> {
+    await this.prisma.skillRun.update({
+      where: { id },
+      data: { status, error: error ?? null, completedAt: new Date() },
+    });
+  }
+
+  async list(skillId?: string): Promise<any[]> {
+    const rows = await this.prisma.skillRun.findMany({
+      where: skillId ? { skillId } : undefined,
+      orderBy: { startedAt: 'desc' },
+      take: 50,
+    });
+    return rows.map((r: any) => ({
+      id: r.id,
+      skillId: r.skillId,
+      skillVersion: r.skillVersion,
+      taskId: r.taskId,
+      inputs: JSON.parse(r.inputsJson),
+      status: r.status,
+      error: r.error,
+      startedAt: r.startedAt,
+      completedAt: r.completedAt,
+    }));
   }
 }

@@ -4,12 +4,15 @@ import {
   ApprovalRepository,
   EvidenceRepository,
   TaskRepository,
+  SkillRepository,
+  SkillRunRepository,
 } from '@ghost/storage';
 import { ExecutionEngine } from '@ghost/engine';
 import {
   isModelError,
   ModelProviderCapabilities,
   OllamaProvider,
+  OllamaVisionObserver,
   StructuredPlanner,
 } from '@ghost/models';
 import { createApp, ModelHealth } from './app.js';
@@ -56,12 +59,18 @@ async function main(): Promise<void> {
   const approvalRepo = new ApprovalRepository(prisma);
   const evidenceRepo = new EvidenceRepository(config.evidenceDir, prisma);
 
-  const policy = new ActionPolicy({ allowedOrigin: config.allowedOrigin });
+  const policy = new ActionPolicy({ allowedOrigin: config.allowedOrigin, allowedOrigins: config.approvedOrigins });
   const provider = new OllamaProvider({
     baseUrl: config.ollamaBaseUrl,
     model: config.plannerModel,
     timeoutMs: config.ollamaTimeoutMs,
   });
+  const visionProvider = new OllamaProvider({
+    baseUrl: config.ollamaBaseUrl,
+    model: config.visionModel,
+    timeoutMs: config.ollamaTimeoutMs,
+  });
+  const visionObserver = new OllamaVisionObserver(visionProvider, config.ollamaTimeoutMs, 256);
   const planner = new StructuredPlanner(provider, { policy });
   const engine = new ExecutionEngine(
     taskRepo,
@@ -70,12 +79,22 @@ async function main(): Promise<void> {
     config.evidenceDir,
     {
       policy,
+      allowedOrigins: config.approvedOrigins,
+      planner: planner as any,
       approvalRepo,
       taskTimeoutMs: config.executionTimeoutMs,
       actionTimeoutMs: config.actionTimeoutMs,
+      visual: visionObserver,
+      visionTimeoutMs: config.ollamaTimeoutMs,
+      redactScreenshots: config.redactScreenshots,
+      recoveryLimit: 2,
+      maxRetriesPerAction: 1,
+      recoveryCloseAllowlist: ['Close', 'testid:overlay-close'],
     }
   );
 
+  const skillRepo = new SkillRepository(prisma);
+  const skillRunRepo = new SkillRunRepository(prisma);
   const taskService = new TaskService({
     taskRepo,
     approvalRepo,
@@ -83,6 +102,8 @@ async function main(): Promise<void> {
     engine,
     policy,
     plannerModel: config.plannerModel,
+    approvedOrigins: config.approvedOrigins,
+    skillRunRepo,
     observationProvider: () => collectPageObservation(config.allowedOrigin),
   });
 
@@ -110,16 +131,31 @@ async function main(): Promise<void> {
       error = { code, message };
     }
 
+    let visionCapabilities: ModelProviderCapabilities | null = null;
+    let visionError: ModelHealth['error'] = null;
+    try {
+      visionCapabilities = await visionObserver.probe();
+    } catch (probeError) {
+      const code = isModelError(probeError) ? probeError.code : 'CONNECTION_FAILED';
+      const message = isModelError(probeError)
+        ? probeError.message
+        : 'Unable to probe the local vision model';
+      visionError = { code, message };
+    }
+
     const snapshot: CapabilitySnapshot = {
       plannerModel: config.plannerModel,
       connected: capabilities?.connected ?? error?.code !== 'CONNECTION_FAILED',
       modelAvailable: capabilities?.modelAvailable ?? false,
       textGeneration: capabilities?.textGeneration ?? false,
       structuredOutput: capabilities?.structuredOutput ?? false,
-      vision: capabilities?.vision ?? false,
+      vision: capabilities?.vision ?? visionCapabilities?.vision ?? false,
       degradedFeatures: capabilities?.degradedFeatures ?? ['planner_unavailable'],
       lastErrorCode: error?.code,
       checkedAt: now,
+      visionModel: config.visionModel,
+      visionConnected: visionCapabilities?.connected ?? false,
+      visionLastErrorCode: visionError?.code,
     };
 
     const value: ModelHealth = { capabilities: snapshot, error };
@@ -127,10 +163,11 @@ async function main(): Promise<void> {
     return value;
   };
 
-  const app = await createApp({ config, taskService, getModelHealth });
+  const app = await createApp({ config, taskService, getModelHealth, skillRepo, skillRunRepo });
 
   const shutdown = async () => {
     provider.cancelAll();
+    visionProvider.cancelAll();
     await app.close().catch(() => undefined);
     await prisma.$disconnect().catch(() => undefined);
   };
@@ -141,6 +178,7 @@ async function main(): Promise<void> {
   console.log(`GHOST Phase 2 server running at http://localhost:${config.port}`);
   console.log(`Allowed demo origin: ${config.allowedOrigin}`);
   console.log(`Planner model: ${config.plannerModel} (local Ollama only)`);
+  console.log(`Vision model: ${config.visionModel} (local Ollama only, optional)`);
 }
 
 main().catch((error) => {

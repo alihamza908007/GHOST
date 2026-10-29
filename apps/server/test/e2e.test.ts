@@ -87,11 +87,14 @@ function configFor(evidenceDir: string): GhostConfig {
     dashboardOrigins: ['http://localhost:3000'],
     ollamaBaseUrl: 'http://127.0.0.1:11434',
     plannerModel: 'gpt-oss:20b',
+    visionModel: 'lfm3-omni:2b',
     ollamaTimeoutMs: 45_000,
     executionTimeoutMs: 60_000,
     actionTimeoutMs: 10_000,
     evidenceDir,
     modelProbeCacheMs: 1_000,
+    redactScreenshots: true,
+    approvedOrigins: [origin],
   };
 }
 
@@ -236,8 +239,15 @@ describe('Phase 2 end-to-end (fake planner, real engine, real demo DOM)', () => 
       const evidenceRecords = await prisma.evidence.findMany({
         where: { taskId: created.id },
       });
-      expect(evidenceRecords).toHaveLength(1);
-      expect(evidenceRecords[0].size).toBeGreaterThan(0);
+      // Post-action screenshots are captured for FILL and CLICK steps and for
+      // explicit SCREENSHOT steps, so a passing task accumulates evidence.
+      expect(evidenceRecords.length).toBeGreaterThanOrEqual(1);
+      expect(
+        evidenceRecords.some((record) => record.type === 'screenshot')
+      ).toBe(true);
+      expect(
+        evidenceRecords.every((record) => (record.size ?? 0) > 0)
+      ).toBe(true);
 
       const shotUrl = await app.inject({
         method: 'GET',

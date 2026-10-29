@@ -15,6 +15,8 @@ export const LIMITS = {
   MAX_EXPECTATION_TEXT_CHARS: 200,
   MAX_LOCATOR_VALUE_CHARS: 100,
   MAX_FILL_VALUE_CHARS: 500,
+  MAX_RECOVERY_ATTEMPTS: 2,
+  MAX_RECOVERY_RETRIES_PER_ACTION: 1,
 } as const;
 
 export const TaskStatusSchema = z.enum([
@@ -23,6 +25,7 @@ export const TaskStatusSchema = z.enum([
   'PLAN_READY',
   'EXECUTING',
   'VERIFYING',
+  'RETRYING',
   'AWAITING_APPROVAL',
   'COMPLETED',
   'FAILED',

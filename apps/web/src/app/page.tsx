@@ -17,6 +17,7 @@ import {
   Ban,
   ThumbsUp,
   ThumbsDown,
+  Eye,
 } from 'lucide-react';
 
 const API = process.env.NEXT_PUBLIC_GHOST_API_URL || 'http://localhost:3002';
@@ -60,6 +61,8 @@ interface Task {
   currentStepIndex: number;
   currentStep?: number;
   plan: Plan | null;
+  approvedOrigins?: string[] | null;
+  researchResultJson?: string | null;
   planSummary?: string | null;
   plannerModel?: string | null;
   error?: string | null;
@@ -85,13 +88,16 @@ interface ModelHealth {
 
 const TERMINAL = ['COMPLETED', 'FAILED', 'CANCELLED'];
 
-const STAGE_ORDER = ['PLANNING', 'PLAN_READY', 'EXECUTING', 'VERIFYING', 'COMPLETED'];
+const STAGE_ORDER = ['PLANNING', 'PLAN_READY', 'EXECUTING', 'VERIFYING', 'RETRYING', 'COMPLETED'];
+
+const MAX_RECOVERY_LIMIT = 2;
 
 function statusColor(status: string): string {
   if (status === 'COMPLETED') return 'bg-green-500/10 text-green-400 border-green-500/20';
   if (status === 'FAILED') return 'bg-red-500/10 text-red-400 border-red-500/20';
   if (status === 'CANCELLED') return 'bg-zinc-500/10 text-zinc-400 border-zinc-500/20';
   if (status === 'AWAITING_APPROVAL') return 'bg-amber-500/10 text-amber-300 border-amber-500/20';
+  if (status === 'RETRYING') return 'bg-amber-500/10 text-amber-300 border-amber-500/20';
   return 'bg-blue-500/10 text-blue-400 border-blue-500/20';
 }
 
@@ -180,6 +186,72 @@ function eventSummary(event: TaskEvent): { title: string; detail?: string; tone:
       return { title: 'Action approved', detail: detailValue, tone: 'text-green-400' };
     case 'APPROVAL_REJECTED':
       return { title: 'Action rejected', detail: detailValue, tone: 'text-red-400' };
+    case 'VISUAL_OBSERVATION_STARTED':
+      return {
+        title: 'Visual observation started',
+        detail: `Checking expected condition: ${String(data.expectedCondition ?? 'present')}`,
+        tone: 'text-blue-400',
+      };
+    case 'VISUAL_OBSERVATION_COMPLETED':
+      return {
+        title: 'Visual observation complete',
+        detail: [
+          typeof data.summary === 'string' ? data.summary : undefined,
+          typeof data.expectedCondition === 'string' ? `expected: ${data.expectedCondition}` : undefined,
+        ]
+          .filter(Boolean)
+          .join(' · '),
+        tone: data.available === false ? 'text-amber-300' : 'text-green-400',
+      };
+    case 'VISUAL_UNAVAILABLE':
+      return {
+        title: 'Visual observation unavailable',
+        detail: typeof data.reason === 'string' ? data.reason : 'Local vision model did not produce evidence',
+        tone: 'text-amber-300',
+      };
+    case 'DOM_VISUAL_DISAGREEMENT':
+      return {
+        title: 'Deterministic and visual checks disagreed',
+        detail: [
+          typeof data.deterministicOutcome === 'string' ? `deterministic: ${data.deterministicOutcome}` : undefined,
+          typeof data.visualSummary === 'string' ? `visual: ${data.visualSummary}` : undefined,
+        ]
+          .filter(Boolean)
+          .join(' · '),
+        tone: 'text-amber-300',
+      };
+    case 'RECOVERY_STARTED':
+      return {
+        title: 'Bounded recovery started',
+        detail: `Recovery attempt ${String(data.recoveryAttempt ?? '')}${
+          typeof data.stepIndex === 'number' ? ` at step ${data.stepIndex + 1}` : ''
+        }`,
+        tone: 'text-amber-300',
+      };
+    case 'RECOVERY_COMPLETED':
+      return { title: 'Bounded recovery completed', detail: detailValue, tone: 'text-green-400' };
+    case 'RETRY_AUTHORIZED':
+      return {
+        title: 'Retry authorized by recovery policy',
+        detail: detailValue,
+        tone: 'text-blue-400',
+      };
+    case 'RETRY_REJECTED':
+      return { title: 'Retry rejected', detail: detailValue, tone: 'text-red-400' };
+    case 'RECOVERY_BUDGET_EXHAUSTED':
+      return {
+        title: 'Recovery budget exhausted',
+        detail: detailValue,
+        tone: 'text-red-400',
+      };
+    case 'ORIGIN_TRANSITION':
+      return {
+        title: 'Origin transition',
+        detail: `${String(data.from ?? '')} → ${String(data.to ?? '')}${
+          data.authorized === false ? ' (rejected)' : ''
+        }`,
+        tone: data.authorized === false ? 'text-red-400' : 'text-blue-400',
+      };
     case 'TASK_CANCELLED':
       return { title: 'Task cancelled', detail: detailValue, tone: 'text-zinc-400' };
     case 'TASK_COMPLETED':
@@ -197,6 +269,7 @@ export default function Dashboard() {
   const [objective, setObjective] = useState(
     'Open the GHOST demo application, fill the Email field with demo@example.com, click Sign in, and capture a screenshot.'
   );
+  const [approvedOrigins, setApprovedOrigins] = useState('');
   const [tasks, setTasks] = useState<Task[]>([]);
   const [task, setTask] = useState<Task | null>(null);
   const [events, setEvents] = useState<TaskEvent[]>([]);
@@ -206,6 +279,24 @@ export default function Dashboard() {
   const [approvalBusy, setApprovalBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [modelHealth, setModelHealth] = useState<ModelHealth | null>(null);
+  const [skills, setSkills] = useState<Array<{ id: string; name: string }>>([]);
+  const [skillName, setSkillName] = useState('');
+  const [skillInputs, setSkillInputs] = useState('');
+  const [runningSkill, setRunningSkill] = useState<string | null>(null);
+  const [researchObjective, setResearchObjective] = useState('');
+  const [researchOrigins, setResearchOrigins] = useState('');
+  const [researchFields, setResearchFields] = useState('');
+
+  const refreshSkills = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/skills`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setSkills(Array.isArray(data.skills) ? data.skills : []);
+    } catch {
+      // non-critical
+    }
+  }, []);
 
   const refreshTasks = useCallback(async () => {
     try {
@@ -234,7 +325,8 @@ export default function Dashboard() {
   useEffect(() => {
     void refreshTasks();
     void refreshModelHealth();
-  }, [refreshTasks, refreshModelHealth]);
+    void refreshSkills();
+  }, [refreshTasks, refreshModelHealth, refreshSkills]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -302,7 +394,13 @@ export default function Dashboard() {
       const res = await fetch(`${API}/tasks/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ objective: finalObjective }),
+        body: JSON.stringify({
+          objective: finalObjective,
+          approvedOrigins: approvedOrigins
+            .split(',')
+            .map((item) => item.trim())
+            .filter(Boolean),
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Unable to start task');
@@ -354,6 +452,50 @@ export default function Dashboard() {
     }
   };
 
+  const saveSkill = async () => {
+    if (!task || task.status !== 'COMPLETED' || !skillName.trim()) return;
+    try {
+      const res = await fetch(`${API}/skills`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: skillName.trim(), definition: { objective: task.objective, steps: task.plan?.steps ?? [] } }),
+      });
+      if (res.ok) {
+        setSkillName('');
+        void refreshSkills();
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const runResearch = async () => {
+    if (!researchObjective.trim()) return;
+    setIsStarting(true);
+    try {
+      let fields: Array<{ name: string; type: string }> = [];
+      if (researchFields.trim()) {
+        try { fields = JSON.parse(researchFields); } catch { fields = []; }
+      }
+      const res = await fetch(`${API}/research`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          objective: researchObjective,
+          approvedOrigins: researchOrigins.split(',').map((s) => s.trim()).filter(Boolean),
+          fields,
+          pageBudget: 5,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok && data.taskId) selectTask(data.taskId);
+    } catch {
+      // ignore
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
   const health = modelHealth?.capabilities;
   const modelOk = Boolean(health?.connected && health?.modelAvailable && !modelHealth?.error);
   const modelDetail = modelHealth?.error
@@ -397,6 +539,17 @@ export default function Dashboard() {
             />
             <div className="flex items-center justify-between mt-3 gap-3">
               <span className="text-[11px] text-zinc-600">{objective.length}/1000</span>
+            </div>
+            <div className="mt-3">
+              <label className="text-[11px] text-zinc-600 block mb-1">Approved origins (comma-separated, optional)</label>
+              <input
+                value={approvedOrigins}
+                onChange={(event) => setApprovedOrigins(event.target.value)}
+                placeholder="http://127.0.0.1:3001"
+                className="w-full bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200 outline-none focus:border-zinc-600"
+              />
+            </div>
+            <div className="flex items-center justify-end mt-3">
               <button
                 onClick={() => void startTask()}
                 disabled={isStarting || !objective.trim()}
@@ -454,6 +607,73 @@ export default function Dashboard() {
               ))}
             </div>
           </div>
+
+          <div className="bg-[#161616] border border-zinc-800 p-5 rounded-2xl">
+            <h2 className="text-zinc-400 text-sm font-medium mb-3">Saved skills</h2>
+            {skills.length === 0 && <p className="text-zinc-600 text-sm">No skills saved yet.</p>}
+            <div className="space-y-1">
+              {skills.map((s) => (
+                <div key={s.id} className="text-xs text-zinc-300 border border-zinc-800 rounded-lg p-2 flex items-center justify-between gap-2">
+                  <span>{s.name}</span>
+                  <button
+                    onClick={async () => {
+                      setRunningSkill(s.id);
+                      try {
+                        let inputs: Record<string, unknown> = {};
+                        if (skillInputs.trim()) {
+                          try { inputs = JSON.parse(skillInputs); } catch { inputs = {}; }
+                        }
+                        const res = await fetch(`${API}/skills/${s.id}/run`, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ inputs }),
+                        });
+                        const data = await res.json();
+                        if (res.ok && data.taskId) selectTask(data.taskId);
+                      } finally {
+                        setRunningSkill(null);
+                      }
+                    }}
+                    disabled={runningSkill === s.id}
+                    className="text-[10px] bg-zinc-800 text-zinc-200 rounded px-2 py-1 disabled:opacity-50"
+                  >
+                    {runningSkill === s.id ? 'Running…' : 'Run'}
+                  </button>
+                </div>
+              ))}
+            </div>
+            <input
+              value={skillInputs}
+              onChange={(e) => setSkillInputs(e.target.value)}
+              placeholder='Inputs JSON (optional)'
+              className="mt-2 w-full bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200"
+            />
+          </div>
+          <div className="bg-[#161616] border border-zinc-800 p-5 rounded-2xl">
+            <h2 className="text-zinc-400 text-sm font-medium mb-3">Research</h2>
+            <textarea
+              value={researchObjective}
+              onChange={(e) => setResearchObjective(e.target.value)}
+              placeholder="Research objective"
+              rows={3}
+              className="w-full bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200 resize-none mb-2"
+            />
+            <input
+              value={researchOrigins}
+              onChange={(e) => setResearchOrigins(e.target.value)}
+              placeholder="Approved origins (comma-separated)"
+              className="w-full bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200 mb-2"
+            />
+            <input
+              value={researchFields}
+              onChange={(e) => setResearchFields(e.target.value)}
+              placeholder='Fields JSON: [{"name":"Version","type":"string"}]'
+              className="w-full bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200 mb-2"
+            />
+            <button onClick={() => void runResearch()} disabled={isStarting || !researchObjective.trim()} className="w-full text-xs bg-white text-black rounded-xl px-3 py-2 font-medium disabled:opacity-50">
+              {isStarting ? 'Running…' : 'Run research'}
+            </button>
+          </div>
         </section>
 
         <section className="lg:col-span-2 space-y-6">
@@ -508,7 +728,7 @@ export default function Dashboard() {
                   )}
                 </div>
 
-                <div className="grid grid-cols-5 gap-2 mt-4">
+                <div className="grid grid-cols-6 gap-2 mt-4">
                   {STAGE_ORDER.map((stage, index) => {
                     const active = index <= stageIndex(task.status);
                     const current = index === stageIndex(task.status) && !TERMINAL.includes(task.status);
@@ -534,6 +754,75 @@ export default function Dashboard() {
                 <p className="text-sm text-zinc-300 mt-4">{task.objective}</p>
                 {task.planSummary && (
                   <p className="text-xs text-zinc-500 mt-1">{task.planSummary}</p>
+                )}
+                {task.approvedOrigins && task.approvedOrigins.length > 0 && (
+                  <p className="text-xs text-zinc-500 mt-1">
+                    Approved origins: {task.approvedOrigins.join(', ')}
+                  </p>
+                )}
+                {task.researchResultJson && (
+                  <div className="mt-3 border border-zinc-800 rounded-xl p-3">
+                    <p className="text-xs text-zinc-400 mb-2">Research findings</p>
+                    <pre className="text-[10px] text-zinc-300 whitespace-pre-wrap break-words">{task.researchResultJson}</pre>
+                    <div className="flex gap-2 mt-2">
+                      <button
+                        onClick={() => {
+                          if (!task.researchResultJson) return;
+                          const blob = new Blob([task.researchResultJson], { type: 'application/json' });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url;
+                          a.download = `research-${task.id}.json`;
+                          a.click();
+                          URL.revokeObjectURL(url);
+                        }}
+                        className="text-[10px] bg-zinc-800 text-zinc-200 rounded px-2 py-1"
+                      >
+                        Export JSON
+                      </button>
+                      <button
+                        onClick={() => {
+                          if (!task.researchResultJson) return;
+                          try {
+                            const parsed = JSON.parse(task.researchResultJson);
+                            const findings = Array.isArray(parsed.findings) ? parsed.findings : [];
+                            const rows = [['field', 'value', 'status', 'sourceUrl']];
+                            for (const f of findings) {
+                              rows.push([f.field ?? '', f.value ?? '', f.status ?? '', f.sourceUrl ?? '']);
+                            }
+                            const csv = rows
+                              .map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(','))
+                              .join('\n');
+                            const blob = new Blob([csv], { type: 'text/csv' });
+                            const url = URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.href = url;
+                            a.download = `research-${task.id}.csv`;
+                            a.click();
+                            URL.revokeObjectURL(url);
+                          } catch {
+                            // ignore
+                          }
+                        }}
+                        className="text-[10px] bg-zinc-800 text-zinc-200 rounded px-2 py-1"
+                      >
+                        Export CSV
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {task.status === 'COMPLETED' && (
+                  <div className="mt-3 flex gap-2">
+                    <input
+                      value={skillName}
+                      onChange={(e) => setSkillName(e.target.value)}
+                      placeholder="Save as skill name"
+                      className="flex-1 bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200"
+                    />
+                    <button onClick={() => void saveSkill()} className="text-xs bg-zinc-800 text-zinc-200 rounded-xl px-3 py-2">
+                      Save skill
+                    </button>
+                  </div>
                 )}
               </div>
 
@@ -674,6 +963,31 @@ export default function Dashboard() {
               </div>
             </>
           )}
+          <div className="bg-[#161616] border border-zinc-800 p-5 rounded-2xl">
+            <h2 className="text-zinc-400 text-sm font-medium mb-3">Research</h2>
+            <textarea
+              value={researchObjective}
+              onChange={(e) => setResearchObjective(e.target.value)}
+              placeholder="Research objective"
+              rows={3}
+              className="w-full bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200 resize-none mb-2"
+            />
+            <input
+              value={researchOrigins}
+              onChange={(e) => setResearchOrigins(e.target.value)}
+              placeholder="Approved origins (comma-separated)"
+              className="w-full bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200 mb-2"
+            />
+            <input
+              value={researchFields}
+              onChange={(e) => setResearchFields(e.target.value)}
+              placeholder='Fields JSON: [{"name":"Version","type":"string"}]'
+              className="w-full bg-[#0d0d0d] border border-zinc-800 rounded-xl p-2 text-xs text-zinc-200 mb-2"
+            />
+            <button onClick={() => void runResearch()} disabled={isStarting || !researchObjective.trim()} className="w-full text-xs bg-white text-black rounded-xl px-3 py-2 font-medium disabled:opacity-50">
+              {isStarting ? 'Running…' : 'Run research'}
+            </button>
+          </div>
         </section>
       </main>
     </div>

@@ -1,239 +1,127 @@
-# GHOST — Phase 2: Local Structured Planning
+# GHOST — Local-First Browser Agent
 
-GHOST is a local browser agent. Phase 2 adds a local Ollama planner while keeping
-the Phase 1 execution, security, persistence, evidence, and dashboard layers
-intact.
+GHOST is a local-first browser automation agent. It accepts a natural-language goal, plans a workflow using a local Ollama model, executes permitted browser actions through a controlled Playwright engine, verifies outcomes independently, recovers from reasonable failures, and presents results with evidence.
 
-The trust boundary is fixed:
+**Trust boundary:** `LLM proposes → Zod validates → policy authorizes → engine executes → verifier checks → storage records evidence`
 
-```
-LLM proposes -> Zod validates -> policy authorizes -> engine executes -> verifier checks -> storage records evidence
-```
-
-The model never executes code, never receives browser control, never chooses an
-origin outside the configured demo origin, and is never used as the source of
-truth for success.
+The model never executes code, never receives browser control, never chooses an origin outside the configured approved set, and is never the source of truth for success.
 
 ## Features
 
-- **Local structured planning** with Ollama (`gpt-oss:20b` by default), using
-  Ollama's JSON-schema `format` and Zod validation of every response.
-- **Four supported actions only**: `NAVIGATE`, `CLICK`, `FILL`, `SCREENSHOT`.
-  Locators are semantic (`role`, `label`, `testId`); CSS, XPath, and model-written
-  JavaScript are rejected.
-- **Deterministic policy gate** before planning and again before every action.
-- **Independent verification** from the DOM or evidence file, with persisted
-  method, outcome, timestamp, and evidence reference.
-- **Bounded execution**: at most 8 planned steps, 15 executed actions, 2 planner
-  attempts, bounded request/response size, and per-request timeouts.
-- **Approval workflow** for sensitive `FILL` fields and high-consequence clicks:
-  approve, reject, revalidate, and resume the original browser session.
-- **Ordered, durable history**: tasks, events, approvals, and evidence survive
-  server restarts; duplicate concurrent execution is prevented.
-- **Dashboard** for objectives, model health, plans, progress, verification,
-  approvals, errors, screenshots, and history. Fill values are redacted by the API.
-- **Planner evaluation** with six reproducible cases, including ambiguous
-  objectives, unexpected origins, step budgets, and page prompt injection.
+- **Local structured planning** with Ollama (`gpt-oss:20b` by default).
+- **Adaptive observe-plan-act-verify loop** with bounded replanning (max 3 iterations).
+- **Four supported actions:** `NAVIGATE`, `CLICK`, `FILL`, `SCREENSHOT`. Semantic locators only (role, label, testId). No CSS/XPath/JS.
+- **Multi-origin authorization:** task-specific approved origin sets, immutable after creation.
+- **Deterministic policy gate** before planning and before every action.
+- **Independent verification** from the DOM/evidence, plus conservative visual observation (`lfm3-omni:2b`).
+- **Bounded recovery:** max 2 attempts/task, max 1 retry/action, no blind retries of consequential actions.
+- **Approval workflow** for sensitive FILL fields and high-consequence clicks.
+- **Research mode:** multi-page structured extraction with CSV/JSON export.
+- **Reusable skills:** save verified workflows, execute with different inputs.
+- **Screenshot redaction** for sensitive inputs (fail-closed).
+- **Evidence filesystem containment** (path traversal + symlink escape protection).
+- **Dashboard:** task submission, live progress, plan, timeline, evidence, approvals, skills, research.
+- **Persistence:** tasks, events, approvals, evidence survive restarts.
 
 ## Prerequisites
 
 - Node.js 18+ and npm
-- Playwright Chromium (`npx playwright install chromium` if not already present)
-- A local [Ollama](https://ollama.com) server
+- Playwright Chromium (`npx playwright install chromium`)
+- Local [Ollama](https://ollama.com) server
 
-### Model requirement
-
-Phase 2 uses exactly the locally installed tag configured by
-`OLLAMA_PLANNER_MODEL` (default `gpt-oss:20b`). GHOST **never pulls or downloads
-a model** and refuses remote inference.
+### Models
 
 ```bash
-ollama list
-ollama pull gpt-oss:20b   # manual, only if you choose to install it
+ollama pull gpt-oss:20b        # planner (required)
+ollama pull lfm3-omni:2b      # visual observer (optional, for visual verification)
 npm run probe:ollama
 ```
 
-The probe verifies connection, model availability, text generation, structured
-output, and vision capability. `gpt-oss:20b` supports structured output and does
-**not** advertise vision, so Phase 2 uses DOM/text verification only.
-`lfm3-omni:2b` is not part of the mandatory path.
+GHOST never pulls or downloads models automatically and refuses remote inference.
 
 ## Setup
 
 1. **Install dependencies**
-
    ```bash
    npm install
    ```
 
 2. **Generate Prisma Client and apply migrations**
-
    ```bash
    npx prisma generate
    npx prisma migrate deploy
    ```
 
-   `migrate deploy` applies the Phase 2 schema and the one-time normalization of
-   legacy Phase 1 `Task.createdAt` / `Task.updatedAt` values, so history ordering
-   is correct.
-
-3. **Optional configuration**
-
-   Copy `.env.example` to `.env` if you need non-default ports or origins. Every
-   value is optional; existing process env wins over `.env`.
-
-4. **Start the demo target** (terminal 1)
-
+3. **Start the demo target**
    ```bash
    node demo_target.js
-   # http://127.0.0.1:3001
    ```
 
-5. **Start the GHOST server** (terminal 2)
-
+4. **Start the server**
    ```bash
    npm run dev:server
-   # http://localhost:3002
    ```
 
-6. **Start the dashboard** (terminal 3)
-
+5. **Start the dashboard**
    ```bash
    npm run dev:web
-   # http://localhost:3000
    ```
-
-Open `http://localhost:3000`, enter an objective, and start a task. Example:
-
-- `Open the GHOST demo application, click the Show message button, and capture a screenshot.`
-- `Open the GHOST demo application, fill the Email field with demo@example.com, click Sign in, and capture a screenshot.`
-
-The second example pauses for approval because `Email` matches the sensitive
-field policy. The API returns `[redacted]` for the value; approving resumes the
-same live browser session, rejecting cancels the task without executing the
-`FILL`.
+   Open http://localhost:3000
 
 ## Configuration
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Loopback-only Ollama endpoint |
-| `OLLAMA_PLANNER_MODEL` | `gpt-oss:20b` | Exact local planner tag |
-| `OLLAMA_TIMEOUT_MS` | `45000` | Planner request timeout |
-| `GHOST_DEMO_ORIGIN` | `http://127.0.0.1:3001` | Exact allowed origin |
-| `GHOST_PORT` | `3002` | API port |
-| `GHOST_DASHBOARD_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | CORS allowlist |
-| `GHOST_EXECUTION_TIMEOUT_MS` | `120000` | Whole-task execution timeout |
-| `GHOST_ACTION_TIMEOUT_MS` | `15000` | Per-action timeout |
-| `GHOST_MODEL_PROBE_CACHE_MS` | `60000` | Model health cache |
-| `EVIDENCE_DIR` | `./evidence_store` | Screenshot storage |
-| `NEXT_PUBLIC_GHOST_API_URL` | `http://localhost:3002` | Dashboard API base |
-| `GHOST_RUN_OLLAMA_INTEGRATION` | unset | Opt in to the real-model test |
+Environment variables (via `.env` or process env):
 
-Ollama URLs are restricted to loopback hosts. `GHOST_DEMO_ORIGIN` is compared by
-exact scheme, host, and port.
+| Variable | Default | Description |
+|---|---|---|
+| `GHOST_PORT` | 3002 | Server port |
+| `GHOST_DEMO_ORIGIN` | http://127.0.0.1:3001 | Primary demo origin |
+| `GHOST_APPROVED_ORIGINS` | (demo origin) | Comma-separated approved origins |
+| `OLLAMA_BASE_URL` | http://127.0.0.1:11434 | Ollama server URL |
+| `OLLAMA_PLANNER_MODEL` | gpt-oss:20b | Planner model tag |
+| `OLLAMA_VISION_MODEL` | lfm3-omni:2b | Visual observer model tag |
+| `OLLAMA_TIMEOUT_MS` | 45000 | Model request timeout |
+| `GHOST_EXECUTION_TIMEOUT_MS` | 120000 | Task execution timeout |
+| `GHOST_ACTION_TIMEOUT_MS` | 15000 | Per-action timeout |
+| `GHOST_REDACT_SCREENSHOTS` | true | Screenshot redaction |
+| `EVIDENCE_DIR` | ./evidence_store | Evidence storage path |
+
+## Usage
+
+1. Open the dashboard at http://localhost:3000.
+2. Enter a natural-language objective.
+3. Optionally specify approved origins (comma-separated).
+4. Click "Plan & Run".
+5. Watch progress, approve/reject actions, view evidence.
+6. For research: use the Research panel with objective, origins, and fields (JSON).
+7. For skills: save a completed workflow as a skill, then run it with different inputs.
 
 ## Commands
 
-```bash
-npm run dev:server          # API on :3002
-npm run dev:web             # dashboard on :3000
-npm run test:run            # deterministic unit/integration suite
-npm run test:integration    # opt-in real gpt-oss:20b test
-npm run typecheck           # server + web TypeScript
-npm run probe:ollama        # model capability verification
-npm run eval:planner        # six-case planner evaluation
-npm run prisma:generate
-npm run prisma:migrate
-```
+| Command | Description |
+|---|---|
+| `npm run dev:server` | Start API server |
+| `npm run dev:web` | Start dashboard |
+| `npm run test:run` | Run unit/integration tests |
+| `npm run typecheck` | TypeScript check (root + web) |
+| `npm run build -w apps/web` | Production web build |
+| `npm run eval:planner` | Planner evaluation (6 cases) |
+| `npm run probe:ollama` | Probe Ollama models |
 
-## API
+## Known limitations
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/health` | Server phase, allowed origin, planner model |
-| `GET` | `/health/model` | Cached Ollama capability snapshot |
-| `POST` | `/tasks/start` | Plan and execute an objective (`{ objective }`) |
-| `GET` | `/tasks` | Newest-first task history |
-| `GET` | `/tasks/:id` | Task, plan (redacted), and pending approval |
-| `GET` | `/tasks/:id/events` | Ordered events (`seq`, `type`, `timestamp`, `data`) |
-| `GET` | `/tasks/:id/approval` | Pending approval (redacted) |
-| `POST` | `/tasks/:id/approval` | `{ decision: "approve" \| "reject", approvalId }` |
-| `POST` | `/tasks/:id/cancel` | Cancel a running or awaiting task |
-| `GET` | `/tasks/:id/screenshot-url` | Evidence URL for the last screenshot |
+- WebSocket/DNS-rebinding not mitigated (Playwright route interception only).
+- Screenshot redaction is heuristic (password inputs masked).
+- Single-node SQLite (no multi-instance).
+- No Playwright Test config (E2E via vitest real-browser tests).
+- Adaptive loop limited to 3 iterations.
+- Research extraction is regex-based (no model extraction).
 
-## Security model
+## Troubleshooting
 
-- **Exact-origin navigation.** Navigation and every browser request must stay on
-  the configured demo origin. Redirects, unexpected subresources, and popups are
-  blocked and recorded as `POLICY_REJECTION`.
-- **No remote inference.** Only loopback Ollama URLs are accepted.
-- **No model-download side effects.** GHOST checks the exact configured tag and
-  fails safely if it is absent.
-- **No model-authored code.** There is no `evaluate`/`EXECUTE_JS` action; unknown
-  actions fail schema validation.
-- **Bounded output and input.** Model output is size-limited and schema-checked.
-  Observations are untrusted text and are delimited in the prompt.
-- **Deterministic policy.** Budgets, origins, expectation/action compatibility,
-  screenshot coverage, and weak click postconditions are checked in code.
-- **Approval revalidation.** After an approval decision, the action schema and
-  policy are revalidated before execution; an approval cannot authorize a changed
-  action.
-- **No success from model claims.** A task is complete only after independent
-  DOM/evidence verification of every step.
-
-## Verification semantics
-
-| Action | Allowed expectation |
-| --- | --- |
-| `NAVIGATE` | `url`, `visibleText`, `elementVisible` |
-| `CLICK` | `url`, `visibleText`, `elementVisible` (a real postcondition) |
-| `FILL` | `fieldValue`, `visibleText`, `elementVisible` |
-| `SCREENSHOT` | `screenshot` |
-
-Every verification result is persisted with `method`, `outcome`, `timestamp`, and
-`evidenceRef`. A click whose expectation was already true before the click is
-reported as `inconclusive`, not `passed`. A plan that drops a screenshot requested
-by the objective is rejected (`MISSING_REQUIRED_SCREENSHOT`), and a click whose
-expectation merely restates the clicked control is rejected
-(`WEAK_CLICK_POSTCONDITION`).
-
-## Tests and measured results
-
-Deterministic suite (mocked model, CI-safe):
-
-- **60 passed, 1 skipped** across 9 files
-- The skipped test is the opt-in real-model integration test
-- `npx tsc --noEmit` and `npx tsc --noEmit -p apps/web` both pass
-
-Real local-model checks (this machine, Ollama 0.40.12, `gpt-oss:20b`):
-
-- **Probe:** connected, model available, text generation, structured output
-  `true`; vision `false`.
-- **Planner eval:** **6/6** cases pass; average latency **4189 ms**, p50
-  **3565 ms**, max **9635 ms**. Safe rejection for ambiguous, unapproved-origin,
-  and over-budget objectives; the injected-page case produced only a plan on the
-  approved origin.
-- **Real end-to-end, no approval:** 3 steps (`NAVIGATE` → `CLICK` → `SCREENSHOT`),
-  3/3 verifications passed, 40 KB PNG evidence.
-- **Real end-to-end with approval:** paused at a sensitive `FILL`, API redacted
-  the value, approval resumed the same session, 4/4 verifications passed, 44 KB
-  PNG evidence.
-- **Real rejection:** task moved to `CANCELLED`; `APPROVAL_REJECTED` recorded and
-  no `FILL` action executed.
-- **Restart persistence:** completed tasks retained status, plan, ordered events,
-  approvals, and evidence; history lists newest first.
-
-## Known limitations and deferred Phase 3
-
-- Verification is DOM/evidence-based only; there is no visual model judgment.
-- The planner supports four actions and a single demo origin; multi-site and
-  authenticated flows are out of scope.
-- Approval is a narrow human-in-the-loop gate, not a full RBAC/identity system.
-- SQLite and local filesystem storage are single-node only.
-- No autonomous recovery/replanning loop after a verification failure; failures
-  are recorded and surfaced.
-- Browser sessions are kept in memory while awaiting approval; a server restart
-  marks interrupted tasks failed.
-- Phase 3 features (richer action set, visual verification, multi-origin policy,
-  distributed storage, deeper evaluation) are intentionally not implemented.
+- **Model not found:** Ensure Ollama is running and models are pulled. Run `npm run probe:ollama`.
+- **Port conflicts:** Set `GHOST_PORT` or `DEMO_PORT`.
+- **Database errors:** Run `npx prisma migrate deploy`.
+- **No evidence:** Check `EVIDENCE_DIR` and permissions.
+EOF
+echo done

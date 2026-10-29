@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { normalizeOrigins } from '@ghost/core';
 
 /**
  * Tiny .env loader. Existing process env always wins and values are never
@@ -34,14 +35,17 @@ export function loadDotEnv(cwd = process.cwd()): void {
 export interface GhostConfig {
   port: number;
   allowedOrigin: string;
+  approvedOrigins: string[];
   dashboardOrigins: string[];
   ollamaBaseUrl: string;
   plannerModel: string;
+  visionModel: string;
   ollamaTimeoutMs: number;
   executionTimeoutMs: number;
   actionTimeoutMs: number;
   evidenceDir: string;
   modelProbeCacheMs: number;
+  redactScreenshots: boolean;
 }
 
 function positiveInt(value: string | undefined, fallback: number): number {
@@ -82,13 +86,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GhostConfig {
       env.GHOST_DEMO_ORIGIN ?? 'http://127.0.0.1:3001',
       'GHOST_DEMO_ORIGIN'
     ),
+    approvedOrigins: normalizeOrigins([
+      env.GHOST_DEMO_ORIGIN ?? 'http://127.0.0.1:3001',
+      ...(env.GHOST_APPROVED_ORIGINS ?? '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ]),
     dashboardOrigins,
     ollamaBaseUrl: env.OLLAMA_BASE_URL ?? 'http://127.0.0.1:11434',
     plannerModel: env.OLLAMA_PLANNER_MODEL ?? 'gpt-oss:20b',
+    visionModel: env.OLLAMA_VISION_MODEL ?? 'lfm3-omni:2b',
     ollamaTimeoutMs: positiveInt(env.OLLAMA_TIMEOUT_MS, 45_000),
     executionTimeoutMs: positiveInt(env.GHOST_EXECUTION_TIMEOUT_MS, 120_000),
     actionTimeoutMs: positiveInt(env.GHOST_ACTION_TIMEOUT_MS, 15_000),
     evidenceDir,
     modelProbeCacheMs: positiveInt(env.GHOST_MODEL_PROBE_CACHE_MS, 60_000),
+    redactScreenshots: env.GHOST_REDACT_SCREENSHOTS !== 'false',
   };
 }

@@ -9,9 +9,15 @@ import {
   Task,
   TaskEvent,
   TaskEventType,
+  TaskStatus,
   VerificationResult,
+  VisualEvaluation,
+  VisualObserverLike,
   actionsEqual,
   isTerminalStatus,
+  resolveContainedEvidencePath,
+  normalizeOrigins,
+  normalizeOrigin,
 } from '@ghost/core';
 import { IApprovalRepository, IEvidenceRepository, ITaskRepository } from '@ghost/storage';
 import { Browser, BrowserContext, chromium, Page } from 'playwright';
@@ -26,11 +32,24 @@ import {
   VerificationError,
 } from './errors.js';
 import { BrowserToolRegistry, BrowserToolResult } from './tools.js';
+
+function isCancelled(status: TaskStatus): boolean {
+  return status === 'CANCELLED';
+}
+import { evaluateRecovery } from './recovery.js';
 import {
+  combineVerification,
   evaluateExpectation,
   VerificationContext,
   verifyAction,
 } from './verification.js';
+
+export interface IPlanProvider {
+  plan(
+    context: { objective: string; observations?: string[]; approvedOrigins?: string[]; priorActions?: any[] },
+    options: { requestId: string; signal?: AbortSignal }
+  ): Promise<{ plan: Plan; attempts: number; latencyMs: number; model: string }>;
+}
 
 export interface IExecutionEngine {
   executePlan(
@@ -56,6 +75,22 @@ export interface ExecutionEngineOptions {
   actionTimeoutMs?: number;
   taskTimeoutMs?: number;
   tools?: BrowserToolRegistry;
+  /** Optional local visual perception collaborator. */
+  visual?: VisualObserverLike;
+  /** Optional planner for adaptive replanning. */
+  planner?: IPlanProvider;
+  /** Visual inference timeout in milliseconds. */
+  visionTimeoutMs?: number;
+  /** Maximum recovery operations per task. */
+  recoveryLimit?: number;
+  /** Maximum retries of a single action within the recovery budget. */
+  maxRetriesPerAction?: number;
+  /** Allowlisted semantic close-control names for overlay dismissal. */
+  recoveryCloseAllowlist?: string[];
+  /** Approved origins for this task/engine (multi-origin). */
+  allowedOrigins?: string[];
+  /** Whether screenshots are redacted for sensitive inputs before persistence. Defaults to true. */
+  redactScreenshots?: boolean;
 }
 
 interface VerificationSummary {
@@ -85,6 +120,11 @@ export class ExecutionEngine implements IExecutionEngine {
   private readonly tools: BrowserToolRegistry;
   private readonly active = new Set<string>();
   private readonly pausedSessions = new Map<string, PausedSession>();
+  private readonly lastVisual = new Map<string, VisualEvaluation>();
+  private allowedOrigins: string[] = [];
+  private readonly lastVerification = new Map<string, VerificationResult>();
+  private readonly recoveryCounts = new Map<string, number>();
+  private readonly retryCounts = new Map<string, number>();
 
   constructor(
     private taskRepo: ITaskRepository,
@@ -94,14 +134,32 @@ export class ExecutionEngine implements IExecutionEngine {
     private options: ExecutionEngineOptions = {}
   ) {
     this.tools = options.tools ?? new BrowserToolRegistry();
+    this.allowedOrigins = normalizeOrigins([
+      ...(options.allowedOrigins ?? []),
+      ...(options.policy?.allowedOrigins ?? []),
+      allowedOrigin,
+    ]);
+    if (this.allowedOrigins.length === 0) this.allowedOrigins = [allowedOrigin];
   }
 
   private get policy(): ActionPolicy {
-    return this.options.policy ?? new ActionPolicy({ allowedOrigin: this.allowedOrigin });
+    return this.options.policy ?? new ActionPolicy({ allowedOrigins: this.allowedOrigins });
   }
 
   private get maxActions(): number {
     return this.options.maxActions ?? LIMITS.MAX_EXECUTED_ACTIONS;
+  }
+
+  private get recoveryLimit(): number {
+    return this.options.recoveryLimit ?? LIMITS.MAX_RECOVERY_ATTEMPTS;
+  }
+
+  private get maxRetriesPerAction(): number {
+    return this.options.maxRetriesPerAction ?? LIMITS.MAX_RECOVERY_RETRIES_PER_ACTION;
+  }
+
+  private get recoveryCloseAllowlist(): string[] {
+    return this.options.recoveryCloseAllowlist ?? ['Close'];
   }
 
   private async createEvent(
@@ -129,7 +187,14 @@ export class ExecutionEngine implements IExecutionEngine {
     }
     this.active.add(task.id);
 
-    const steps = normalizePlan(rawPlan);
+    let steps = normalizePlan(rawPlan);
+    const taskOrigins = (task.approvedOrigins && task.approvedOrigins.length)
+      ? normalizeOrigins(task.approvedOrigins)
+      : [];
+    if (taskOrigins.length === 0) {
+      throw new PolicyViolationError('INVALID_ACTION', 'Task has no approved origin authorization snapshot');
+    }
+    let currentOrigin = taskOrigins[0];
     const startIndex = options.startIndex ?? 0;
     let executedActions = startIndex;
 
@@ -231,16 +296,23 @@ export class ExecutionEngine implements IExecutionEngine {
           acceptDownloads: false,
         });
 
-        const isAllowedRequestUrl = (rawUrl: string): boolean => {
+        const isAllowedRequestUrl = (rawUrl: string, resourceType: string): boolean => {
+          // Subresource schemes are permitted for non-document requests (e.g.
+          // images/fonts), but a top-level document navigation to data:/blob:/
+          // about: (other than about:blank) would escape the approved origin.
+          const isDocument = resourceType === 'document';
+          if (rawUrl === 'about:blank') return true;
           if (
             rawUrl.startsWith('about:') ||
             rawUrl.startsWith('data:') ||
             rawUrl.startsWith('blob:')
           ) {
-            return true;
+            return !isDocument;
           }
           try {
-            return new URL(rawUrl).origin === this.allowedOrigin;
+            let requestOrigin: string;
+          try { requestOrigin = new URL(rawUrl).origin; } catch { return false; }
+          return taskOrigins.includes(requestOrigin) || taskOrigins.includes(normalizeOrigin(requestOrigin) ?? requestOrigin);
           } catch {
             return false;
           }
@@ -248,7 +320,8 @@ export class ExecutionEngine implements IExecutionEngine {
 
         await context.route('**/*', async (route) => {
           const url = route.request().url();
-          if (!isAllowedRequestUrl(url)) {
+          const resourceType = route.request().resourceType();
+          if (!isAllowedRequestUrl(url, resourceType)) {
             state.blockedRequest = url;
             reportBrowserViolation(
               'A browser request outside the approved origin was blocked'
@@ -281,7 +354,10 @@ export class ExecutionEngine implements IExecutionEngine {
       const actionTimeoutMs = this.options.actionTimeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS;
       const taskTimeoutMs = this.options.taskTimeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
 
-      for (let index = startIndex; index < steps.length; index += 1) {
+      let index = startIndex;
+      let replanCount = 0;
+      const MAX_REPLANS = 2;
+      while (index < steps.length) {
         const step = steps[index]!;
 
         // 1. Task status / cancellation check against persisted state.
@@ -385,7 +461,8 @@ export class ExecutionEngine implements IExecutionEngine {
         // typed tool. A click expectation that already held before the click
         // cannot be used as proof afterwards.
         const baseVerificationContext: VerificationContext = {
-          allowedOrigin: this.allowedOrigin,
+          allowedOrigin: taskOrigins[0],
+          allowedOrigins: taskOrigins,
           taskId: task.id,
           evidenceDir: this.evidenceDir,
           fileExists: (filename) => this.evidenceRepo.exists(filename),
@@ -412,13 +489,34 @@ export class ExecutionEngine implements IExecutionEngine {
         });
 
         let toolResult: BrowserToolResult = {};
+        let actionExecutionFailed: VerificationResult | null = null;
         try {
           toolResult = await this.tools.execute(action, {
             page: activePage,
             taskId: task.id,
             evidenceDir: this.evidenceDir,
             actionTimeoutMs,
+            redactScreenshots: this.options.redactScreenshots,
           });
+        } catch (toolError) {
+          if (
+            toolError instanceof PolicyViolationError ||
+            toolError instanceof CancelledError ||
+            toolError instanceof BudgetError
+          ) {
+            throw toolError;
+          }
+          // An action that could not execute at all cannot satisfy its
+          // postcondition; this becomes a deterministic failed verification so
+          // the conservative recovery path can consider bounded options.
+          actionExecutionFailed = {
+            outcome: 'failed',
+            method: 'action-execution',
+            detail: 'The action could not be executed against the page',
+            timestamp: Date.now(),
+            taskId: task.id,
+            stepIndex: index,
+          };
         } finally {
           if (state.popupViolation) {
             throw new PolicyViolationError(
@@ -442,6 +540,14 @@ export class ExecutionEngine implements IExecutionEngine {
             ? { screenshot: toolResult.evidenceFilename }
             : {}),
         });
+        if (action.type === 'NAVIGATE') {
+          await this.createEvent(task.id, 'ORIGIN_TRANSITION', {
+            stepIndex: index,
+            from: currentOrigin,
+            to: new URL(action.payload.url).origin,
+            authorized: true,
+          });
+        }
 
         if (toolResult.evidenceFilename) {
           await this.evidenceRepo.save({
@@ -454,37 +560,123 @@ export class ExecutionEngine implements IExecutionEngine {
         }
 
         // 7. Independent deterministic verification.
-        const verification = await verifyAction(
-          activePage,
-          action,
-          step.expectation,
-          {
+        const verification: VerificationResult = actionExecutionFailed
+          ? actionExecutionFailed
+          : await verifyAction(
+              activePage,
+              action,
+              step.expectation,
+              {
+                ...baseVerificationContext,
+                evidenceFilename: toolResult.evidenceFilename,
+                preexistingCondition,
+              }
+            );
+        this.lastVerification.set(task.id, verification);
+
+        // Optional visual diagnostic. Deterministic verification stays
+        // authoritative; vision is consulted when the deterministic result is
+        // not conclusive and never overrides a deterministic failure by itself.
+        let visual: VisualEvaluation | undefined;
+        if (
+          this.options.visual &&
+          action.type !== 'SCREENSHOT' &&
+          verification.outcome !== 'passed'
+        ) {
+          visual = await this.runVisual(task.id, action, step, verification, {
             ...baseVerificationContext,
             evidenceFilename: toolResult.evidenceFilename,
-            preexistingCondition,
+          }, index);
+          this.lastVisual.set(task.id, visual);
+          await this.createEvent(task.id, visual.available ? 'VISUAL_OBSERVATION_COMPLETED' : 'VISUAL_UNAVAILABLE', {
+            taskId: task.id,
+            stepIndex: index,
+            actionType: action.type,
+            available: visual.available,
+            ...(visual.observation
+              ? {
+                  expectedCondition: visual.observation.expectedCondition,
+                  summary: visual.observation.summary,
+                }
+              : {}),
+            ...(visual.error ? { reason: visual.error } : {}),
+          });
+          if (visual.available && visual.observation) {
+            const disagreed =
+              verification.outcome === 'failed' &&
+              visual.observation.expectedCondition === 'present';
+            if (!visual.agreed) {
+              await this.createEvent(task.id, 'DOM_VISUAL_DISAGREEMENT', {
+                taskId: task.id,
+                stepIndex: index,
+                actionType: action.type,
+                deterministicOutcome: verification.outcome,
+                visualSummary: visual.observation.summary,
+                expectedCondition: visual.observation.expectedCondition,
+              });
+            }
           }
-        );
+        }
+
+        const finalVerification = this.options.visual
+          ? combineVerification(verification, visual, task.id, index)
+          : verification;
 
         await this.createEvent(task.id, 'VERIFICATION_RESULT', {
           stepIndex: index,
           actionType: action.type,
-          outcome: verification.outcome,
-          method: verification.method,
-          detail: verification.detail,
-          expectationKind: verification.expectationKind,
-          evidenceRef: verification.evidenceRef,
+          outcome: finalVerification.outcome,
+          method: finalVerification.method,
+          detail: finalVerification.detail,
+          expectationKind: finalVerification.expectationKind,
+          evidenceRef: finalVerification.evidenceRef,
         });
 
-        if (verification.outcome !== 'passed') {
-          throw new VerificationError(
-            verification.detail,
-            verification.outcome
-          );
+        if (finalVerification.outcome !== 'passed') {
+          const recovery = await this.runRecovery(task, steps, executedActions, activePage, state, index, finalVerification, startedAt, taskOrigins);
+          if (recovery.kind === 'completed') {
+            return { status: 'completed', executedActions: recovery.executedActions };
+          }
+          if (recovery.kind === 'exhausted') {
+            if (this.options.planner && replanCount < MAX_REPLANS) {
+              replanCount += 1;
+              let pageState = '';
+              try { pageState = await this.capturePageState(activePage); } catch { pageState = ''; }
+              await this.createEvent(task.id, 'PLANNING_STARTED', { replan: true, iteration: replanCount });
+              try {
+                const r = await this.options.planner.plan(
+                  { objective: task.objective, observations: [pageState], approvedOrigins: taskOrigins, priorActions: [] },
+                  { requestId: task.id }
+                );
+                const newSteps = normalizePlan(r.plan);
+                if (newSteps.length > 0) {
+                  const newSig = JSON.stringify(newSteps.map((s: any) => s.action.type + ':' + (s.action.payload?.url ?? '')));
+                  const oldSig = JSON.stringify(steps.map((s: any) => s.action.type + ':' + (s.action.payload?.url ?? '')));
+                  if (newSig !== oldSig) {
+                    steps = newSteps;
+                    index = 0;
+                    task.currentStepIndex = 0;
+                    await this.taskRepo.update(task.id, { currentStepIndex: 0 });
+                    continue;
+                  }
+                }
+              } catch {
+                // fall through
+              }
+            }
+            throw new VerificationError(finalVerification.detail, finalVerification.outcome);
+          }
+          // recovery.kind === 'continue' means a bounded recovery retry of this
+          // step verified successfully; fall through to normal progress handling.
         }
 
         // 8. Persist progress.
+        if (action.type === 'NAVIGATE') {
+          try { currentOrigin = new URL(action.payload.url).origin; } catch { /* keep */ }
+        }
         await this.taskRepo.update(task.id, { currentStepIndex: index + 1 });
         task.currentStepIndex = index + 1;
+        index += 1;
       }
 
       await this.taskRepo.update(task.id, { status: 'VERIFYING' });
@@ -519,6 +711,12 @@ export class ExecutionEngine implements IExecutionEngine {
         return await this.handleFailure(task, policyError, executedActions);
       }
 
+      if (error instanceof VerificationError) {
+        // Recovery is orchestrated inside the plan loop; reaching the catch
+        // means the bounded recovery sequence was exhausted or declined.
+        return await this.handleFailure(task, error, executedActions);
+      }
+
       return await this.handleFailure(task, error, executedActions);
     } finally {
       if (!keepSession) {
@@ -536,6 +734,362 @@ export class ExecutionEngine implements IExecutionEngine {
     this.pausedSessions.delete(taskId);
     await session.context.close().catch(() => undefined);
     await session.browser.close().catch(() => undefined);
+  }
+
+  private async runRecovery(
+    task: Task,
+    steps: PlanStep[],
+    executedActions: number,
+    page: Page | null,
+    state: BrowserSessionState,
+    failedStepIndex: number,
+    verification: VerificationResult,
+    taskStartedAt: number,
+    allowedOrigins: string[] = this.allowedOrigins
+  ): Promise<{ kind: 'completed' | 'continue' | 'exhausted'; executedActions: number }> {
+    const taskId = task.id;
+    let taskStatus: TaskStatus = task.status;
+    let currentVerification = verification;
+    let currentVisual = this.lastVisual.get(taskId) ?? { available: false, error: 'VISUAL_UNAVAILABLE' };
+    let attemptsUsed = this.recoveryCounts.get(taskId) ?? 0;
+
+    // Honor a cancellation that landed before recovery started, even if the
+    // in-memory task object has not been refreshed.
+    const initial = await this.taskRepo.getById(taskId);
+    if (initial?.status === 'CANCELLED' || initial?.status === 'FAILED' || initial?.status === 'COMPLETED') {
+      return { kind: 'exhausted', executedActions };
+    }
+
+    const remainingRecoveryAttempts = Math.max(this.recoveryLimit - attemptsUsed, 0);
+    for (let attempt = 0; attempt < remainingRecoveryAttempts; attempt += 1) {
+      const refreshed = await this.taskRepo.getById(taskId);
+      if (refreshed?.status === 'CANCELLED') {
+        return { kind: 'exhausted', executedActions };
+      }
+      const decision = evaluateRecovery({
+        task,
+        verification: currentVerification,
+        visual: currentVisual,
+        policy: this.policy,
+        allowedOrigin: allowedOrigins[0],
+        allowedOrigins: allowedOrigins,
+        recoveryCloseAllowlist: this.recoveryCloseAllowlist,
+        recoveryAttemptsUsed: attemptsUsed,
+        retriesForAction: this.retryCounts.get(taskId) ?? 0,
+        failedStepIndex,
+      });
+
+      const rejectEventType =
+        decision.code === 'RECOVERY_BUDGET_EXHAUSTED' ? 'RECOVERY_BUDGET_EXHAUSTED' : 'RETRY_REJECTED';
+      if (!decision.allowed || !decision.action) {
+        await this.createEvent(taskId, rejectEventType, {
+          taskId,
+          stepIndex: failedStepIndex,
+          code: decision.code,
+          reason: decision.reason,
+        });
+        return { kind: 'exhausted', executedActions };
+      }
+
+      if (isCancelled(taskStatus)) {
+        return { kind: 'exhausted', executedActions };
+      }
+      if (executedActions >= this.maxActions) {
+        throw new BudgetError(`Action budget of ${this.maxActions} was exhausted`);
+      }
+      if (Date.now() - taskStartedAt > (this.options.taskTimeoutMs ?? DEFAULT_TASK_TIMEOUT_MS)) {
+        throw new BudgetError('Task execution timeout was exceeded');
+      }
+
+      if (decision.action.kind === 'RETRY') {
+        await this.createEvent(taskId, 'RETRY_AUTHORIZED', {
+          taskId,
+          stepIndex: failedStepIndex,
+          recoveryAttempt: attemptsUsed,
+          action: decision.action,
+          reason: decision.reason ?? 'Retry authorized by evidence-driven recovery policy',
+        });
+      }
+
+      attemptsUsed += 1;
+      this.recoveryCounts.set(taskId, attemptsUsed);
+      await this.taskRepo.update(taskId, { status: 'RETRYING', error: null });
+      taskStatus = 'RETRYING';
+      task.error = null;
+      await this.createEvent(taskId, 'RECOVERY_STARTED', {
+        taskId,
+        stepIndex: failedStepIndex,
+        recoveryAttempt: attemptsUsed,
+        action: decision.action,
+        reason: decision.reason,
+      });
+
+      const failedStep = steps[failedStepIndex];
+      const actionSequence: Array<{ action: Action; expectation: PlanStep['expectation']; description: string }> = [];
+      if (decision.action.kind === 'DISMISS_OVERLAY') {
+        const locator = decision.action.locator;
+        if (!locator) return { kind: 'exhausted', executedActions };
+        actionSequence.push({
+          action: { type: 'CLICK', payload: { locator } },
+          expectation: failedStep?.expectation ?? { kind: 'elementVisible', locator },
+          description: 'Dismiss obstructing overlay',
+        });
+        if (failedStep) {
+          actionSequence.push({
+            action: failedStep.action,
+            expectation: failedStep.expectation,
+            description: `Retry step ${failedStepIndex}`,
+          });
+        }
+      } else {
+        const retryStepIndex = decision.action.kind === 'RETRY' ? decision.action.stepIndex : failedStepIndex;
+        const retryStep = steps[retryStepIndex];
+        if (!retryStep) return { kind: 'exhausted', executedActions };
+        actionSequence.push({
+          action: retryStep.action,
+          expectation: retryStep.expectation,
+          description: `Retry step ${retryStepIndex}`,
+        });
+      }
+
+      let sequenceIndex = 0;
+      let lastExecutionFailed = false;
+      while (sequenceIndex < actionSequence.length) {
+        const current = actionSequence[sequenceIndex];
+        if (!current) break;
+        if (isCancelled(taskStatus)) {
+          return { kind: 'exhausted', executedActions };
+        }
+        if (executedActions >= this.maxActions) {
+          throw new BudgetError(`Action budget of ${this.maxActions} was exhausted`);
+        }
+
+        const refreshed = await this.taskRepo.getById(taskId);
+        if (refreshed?.status === 'CANCELLED') {
+          return { kind: 'exhausted', executedActions };
+        }
+        const auth = this.policy.evaluate(current.action);
+        if (!auth.allowed) {
+          await this.createEvent(taskId, 'RETRY_REJECTED', {
+            taskId,
+            stepIndex: failedStepIndex,
+            code: auth.code ?? 'INVALID_ACTION',
+            reason: auth.reason ?? 'Recovery action rejected by policy',
+          });
+          return { kind: 'exhausted', executedActions };
+        }
+        if (auth.requiresApproval) {
+          await this.createEvent(taskId, 'RETRY_REJECTED', {
+            taskId,
+            stepIndex: failedStepIndex,
+            code: 'APPROVAL_REQUIRED_FOR_RECOVERY',
+            reason: auth.reason ?? 'Recovery action requires approval',
+          });
+          return { kind: 'exhausted', executedActions };
+        }
+
+        const context: VerificationContext = {
+          allowedOrigin: allowedOrigins[0],
+          allowedOrigins: allowedOrigins,
+          taskId,
+          evidenceDir: this.evidenceDir,
+          fileExists: (filename) => this.evidenceRepo.exists(filename),
+          fileSize: (filename) => this.evidenceRepo.size(filename),
+          preexistingCondition: false,
+        };
+
+        await this.createEvent(taskId, 'ACTION_STARTED', {
+          stepIndex: failedStepIndex,
+          actionType: current.action.type,
+          description: current.description,
+        });
+
+        let toolResult: BrowserToolResult = {};
+        let elementFailed = false;
+        if (!page) {
+          return { kind: 'exhausted', executedActions };
+        }
+        try {
+          toolResult = await this.tools.execute(current.action, {
+            page,
+            taskId,
+            evidenceDir: this.evidenceDir,
+            actionTimeoutMs: this.options.actionTimeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
+            redactScreenshots: this.options.redactScreenshots,
+          });
+        } catch (toolError) {
+          if (
+            toolError instanceof PolicyViolationError ||
+            toolError instanceof CancelledError ||
+            toolError instanceof BudgetError
+          ) {
+            throw toolError;
+          }
+          elementFailed = true;
+        } finally {
+          if (state.popupViolation) {
+            throw new PolicyViolationError('UNAPPROVED_ORIGIN', 'A popup was opened and rejected by policy');
+          }
+          if (state.blockedRequest) {
+            throw new PolicyViolationError('UNAPPROVED_ORIGIN', 'A browser request outside the approved origin was blocked');
+          }
+        }
+
+        executedActions += 1;
+        await this.createEvent(taskId, 'ACTION_FINISHED', {
+          stepIndex: failedStepIndex,
+          actionType: current.action.type,
+          ...(toolResult.evidenceFilename ? { screenshot: toolResult.evidenceFilename } : {}),
+        });
+
+        if (toolResult.evidenceFilename) {
+          await this.evidenceRepo.save({
+            taskId,
+            filename: toolResult.evidenceFilename,
+            type: 'screenshot',
+            timestamp: Date.now(),
+            size: toolResult.evidenceSize,
+          });
+        }
+
+        taskStatus = 'VERIFYING';
+        task.status = 'VERIFYING';
+        await this.taskRepo.update(taskId, { status: 'VERIFYING', error: null });
+        task.error = null;
+
+        const verificationResult = elementFailed
+          ? {
+              outcome: 'failed' as const,
+              method: 'action-execution',
+              detail: 'The action could not be executed against the page',
+              timestamp: Date.now(),
+              taskId,
+              stepIndex: failedStepIndex,
+            }
+          : await verifyAction(page, current.action, current.expectation, {
+              ...context,
+              evidenceFilename: toolResult.evidenceFilename,
+            });
+        currentVerification = verificationResult;
+        this.lastVerification.set(taskId, verificationResult);
+        await this.createEvent(taskId, 'VERIFICATION_RESULT', {
+          stepIndex: failedStepIndex,
+          actionType: current.action.type,
+          outcome: verificationResult.outcome,
+          method: verificationResult.method,
+          detail: verificationResult.detail,
+          expectationKind: verificationResult.expectationKind,
+          evidenceRef: verificationResult.evidenceRef,
+        });
+
+        if (verificationResult.outcome === 'passed') {
+          if (failedStepIndex + 1 >= steps.length) {
+            taskStatus = 'COMPLETED';
+            task.status = 'COMPLETED';
+            task.currentStepIndex = steps.length;
+            task.error = null;
+            await this.taskRepo.update(taskId, {
+              status: 'COMPLETED',
+              currentStepIndex: steps.length,
+              error: null,
+            });
+            await this.createEvent(taskId, 'TASK_COMPLETED', { executedActions, steps: steps.length, recovery: true });
+            await this.createEvent(taskId, 'RECOVERY_COMPLETED', {
+              taskId,
+              stepIndex: failedStepIndex,
+              recoveryAttempt: attemptsUsed,
+              action: decision.action,
+            });
+            return { kind: 'completed', executedActions };
+          }
+
+          taskStatus = 'EXECUTING';
+          task.status = 'EXECUTING';
+          task.currentStepIndex = failedStepIndex + 1;
+          task.error = null;
+          await this.taskRepo.update(taskId, {
+            status: 'EXECUTING',
+            currentStepIndex: failedStepIndex + 1,
+            error: null,
+          });
+          return { kind: 'continue', executedActions };
+        }
+
+        lastExecutionFailed = true;
+        if (actionSequence.length > 1) {
+          sequenceIndex += 1;
+          continue;
+        }
+        break;
+      }
+
+      if (lastExecutionFailed) {
+        continue;
+      }
+      break;
+    }
+
+    await this.createEvent(taskId, 'RECOVERY_BUDGET_EXHAUSTED', {
+      taskId,
+      stepIndex: failedStepIndex,
+      attemptsUsed,
+    });
+    return { kind: 'exhausted', executedActions };
+  }
+
+  private async runVisual(
+    taskId: string,
+    action: Action,
+    step: PlanStep,
+    verification: VerificationResult,
+    context: VerificationContext,
+    stepIndex: number
+  ): Promise<VisualEvaluation> {
+    const visualObserver = this.options.visual;
+    if (!visualObserver) {
+      return { available: false, error: 'VISUAL_UNAVAILABLE' };
+    }
+
+    const deterministicPassed = verification.outcome === 'passed';
+    if (deterministicPassed) {
+      // Deterministic success stands alone; no visual diagnostic is required.
+      return { available: true, observation: undefined, agreed: true };
+    }
+
+    await this.createEvent(taskId, 'VISUAL_OBSERVATION_STARTED', {
+      taskId,
+      stepIndex,
+      actionType: action.type,
+      expectedCondition: 'present',
+    });
+
+    let screenshotBase64: string | undefined;
+    if (context.evidenceFilename) {
+      try {
+        const fullPath = resolveContainedEvidencePath(context.evidenceDir, context.evidenceFilename ?? '');
+        const buffer = fs.readFileSync(fullPath);
+        screenshotBase64 = buffer.toString('base64');
+      } catch {
+        screenshotBase64 = undefined;
+      }
+    }
+
+    const actionContext = `${action.type} ${step.description ?? ''} deterministic=${verification.method}:${verification.outcome}`;
+    try {
+      const observation = await visualObserver.observe({
+        taskId,
+        screenshotBase64,
+        expectedCondition: 'present',
+        actionContext,
+        domObservations: [verification.detail],
+      });
+      const agreed =
+        verification.outcome !== 'failed' || observation.expectedCondition === 'absent';
+      return { available: true, observation, agreed };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'VISUAL_UNAVAILABLE';
+      return { available: false, error: message };
+    }
   }
 
   private async isApproved(
@@ -557,6 +1111,14 @@ export class ExecutionEngine implements IExecutionEngine {
     // the origin or action schema.
     const revalidated = this.policy.evaluate(action);
     return revalidated.allowed;
+  }
+
+  private async capturePageState(page: Page): Promise<string> {
+    const url = page.url();
+    const title = await page.title().catch(() => '');
+    const text = await page.innerText('body').catch(() => '');
+    const bounded = text.replace(/\s+/g, ' ').trim().slice(0, 2000);
+    return `URL: ${url}\nTitle: ${title}\nText: ${bounded}`;
   }
 
   private async handleFailure(

@@ -16,6 +16,10 @@ model Task {
   planJson         String?
   planSummary      String?
   plannerModel     String?
+  approvedOriginsJson String?
+  researchFieldsJson  String?
+  researchBudget     Int?
+  researchResultJson  String?
   error            String?
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @default(now()) @updatedAt
@@ -60,4 +64,25 @@ model Evidence {
   task      Task     @relation(fields: [taskId], references: [id])
 
   @@index([taskId])
+}
+
+model Skill {
+  id            String   @id
+  name          String
+  version       Int      @default(1)
+  definitionJson String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @default(now()) @updatedAt
+}
+
+model SkillRun {
+  id            String   @id
+  skillId       String
+  skillVersion  Int
+  taskId        String?
+  inputsJson    String
+  status        String
+  error         String?
+  startedAt     DateTime @default(now())
+  completedAt   DateTime?
 }

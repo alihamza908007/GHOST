@@ -9,6 +9,8 @@ import {
   TaskEventType,
   actionsEqual,
   isTerminalStatus,
+  normalizeOrigins,
+  normalizeOrigin,
 } from '@ghost/core';
 import { IApprovalRepository, ITaskRepository } from '@ghost/storage';
 import {
@@ -57,6 +59,8 @@ export interface TaskServiceOptions {
   engine: EngineLike;
   policy: ActionPolicy;
   plannerModel: string;
+  approvedOrigins?: string[];
+  skillRunRepo?: { create: (r: any) => Promise<void>; complete: (id: string, status: string, error?: string) => Promise<void>; list: (skillId?: string) => Promise<any[]> };
   observationProvider?: () => Promise<string[]>;
 }
 
@@ -67,6 +71,8 @@ export class TaskService {
   private readonly engine: EngineLike;
   private readonly policy: ActionPolicy;
   private readonly plannerModel: string;
+  private readonly approvedOrigins?: string[];
+  private readonly skillRunRepo?: { create: (r: any) => Promise<void>; complete: (id: string, status: string, error?: string) => Promise<void>; list: (skillId?: string) => Promise<any[]> };
   private readonly observationProvider?: () => Promise<string[]>;
   private readonly active = new Set<string>();
   private readonly aborts = new Map<string, AbortController>();
@@ -78,10 +84,12 @@ export class TaskService {
     this.engine = options.engine;
     this.policy = options.policy;
     this.plannerModel = options.plannerModel;
+    this.approvedOrigins = options.approvedOrigins ?? this.policy.allowedOrigins;
+    this.skillRunRepo = options.skillRunRepo;
     this.observationProvider = options.observationProvider;
   }
 
-  async startTask(objective: string): Promise<Task> {
+  async startTask(objective: string, approvedOrigins?: string[]): Promise<Task> {
     const cleaned = objective.trim();
     if (cleaned.length === 0) {
       throw new ServiceError('INVALID_OBJECTIVE', 'An objective is required');
@@ -93,10 +101,23 @@ export class TaskService {
       );
     }
 
+    const requested = approvedOrigins && approvedOrigins.length > 0 ? approvedOrigins : (this.approvedOrigins ?? this.policy.allowedOrigins);
+    // Strict: every supplied origin must normalize successfully; no silent dropping.
+    for (const o of requested) {
+      if (normalizeOrigin(o) === null) {
+        throw new ServiceError('INVALID_ORIGIN', `Invalid approved origin: ${o}`, 400);
+      }
+    }
+    const normalizedOrigins = normalizeOrigins(requested);
+    if (normalizedOrigins.length === 0) {
+      throw new ServiceError('INVALID_ORIGIN', 'At least one valid approved origin is required', 400);
+    }
+
     const task: Task = {
       id: crypto.randomUUID(),
       objective: cleaned,
       status: 'PLANNING',
+      approvedOrigins: normalizedOrigins,
       currentStepIndex: 0,
       lastEventId: null,
       plan: null,
@@ -114,6 +135,223 @@ export class TaskService {
     return (await this.taskRepo.getById(task.id)) ?? task;
   }
 
+  async runSkill(skill: { id: string; version: number; definition: any }, inputs: Record<string, unknown>, approvedOrigins?: string[]): Promise<Task> {
+    const cleanedInputs = inputs ?? {};
+    const skillDef = skill.definition;
+    const inputSpecs: Array<{ name: string; type?: string; required?: boolean; maxLength?: number }> = skillDef.inputs ?? [];
+    // Validate required/missing
+    for (const spec of inputSpecs) {
+      if (spec.required !== false) {
+        const v = cleanedInputs[spec.name];
+        if (v === undefined || v === null || v === '') {
+          throw new ServiceError('INVALID_INPUT', `Missing required input: ${spec.name}`, 400);
+        }
+      }
+    }
+    // Validate types and lengths
+    for (const spec of inputSpecs) {
+      const v = cleanedInputs[spec.name];
+      if (v === undefined || v === null) continue;
+      if (spec.type === 'number' && typeof v !== 'number') {
+        throw new ServiceError('INVALID_INPUT', `Input ${spec.name} must be a number`, 400);
+      }
+      if (spec.type === 'string' && typeof v !== 'string') {
+        throw new ServiceError('INVALID_INPUT', `Input ${spec.name} must be a string`, 400);
+      }
+      if (typeof v === 'string' && v.length > (spec.maxLength ?? 500)) {
+        throw new ServiceError('INVALID_INPUT', `Input ${spec.name} exceeds max length`, 400);
+      }
+    }
+    // Reject unknown inputs
+    const allowedNames = new Set(inputSpecs.map((s: any) => s.name));
+    for (const k of Object.keys(cleanedInputs)) {
+      if (!allowedNames.has(k)) {
+        throw new ServiceError('INVALID_INPUT', `Unknown input: ${k}`, 400);
+      }
+    }
+
+    // Redact sensitive inputs for storage
+    const redactedInputs: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(cleanedInputs)) {
+      if (/password|secret|token|apikey/i.test(k)) {
+        redactedInputs[k] = '[redacted]';
+      } else {
+        redactedInputs[k] = v;
+      }
+    }
+
+    const origins = approvedOrigins && approvedOrigins.length > 0
+      ? approvedOrigins
+      : (this.approvedOrigins ?? this.policy.allowedOrigins);
+    const normalizedOrigins = normalizeOrigins(origins);
+    if (normalizedOrigins.length === 0) {
+      throw new ServiceError('INVALID_ORIGIN', 'At least one approved origin is required', 400);
+    }
+
+    const task: Task = {
+      id: crypto.randomUUID(),
+      objective: `Skill: ${skillDef.name ?? skill.id}`,
+      status: 'PLANNING',
+      currentStepIndex: 0,
+      lastEventId: null,
+      plan: null,
+      planSummary: skillDef.description ?? skillDef.name ?? skill.id,
+      plannerModel: 'skill',
+      approvedOrigins: normalizedOrigins,
+      error: null,
+    };
+    await this.taskRepo.create(task);
+
+    const runId = crypto.randomUUID();
+    const skillRunRepo = (this as any).skillRunRepo;
+    if (skillRunRepo) {
+      await skillRunRepo.create({ id: runId, skillId: skill.id, skillVersion: skill.version, taskId: task.id, inputs: redactedInputs });
+    }
+
+    // Fire and forget
+    void (async () => {
+      try {
+        await this.taskRepo.update(task.id, { status: 'PLAN_READY', plan: { objectiveSummary: task.objective, steps: skillDef.steps ?? [], rationale: 'skill' }, planSummary: task.planSummary, currentStepIndex: 0, error: null });
+        Object.assign(task, { status: 'PLAN_READY', plan: { objectiveSummary: task.objective, steps: skillDef.steps ?? [], rationale: 'skill' }, currentStepIndex: 0, error: null });
+        // Substitute placeholders {{name}} in action payloads (string values only).
+        const substitute = (obj: any): any => {
+          if (typeof obj === 'string') {
+            return obj.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_m, name) => {
+              const v = cleanedInputs[name];
+              return v === undefined || v === null ? '' : String(v);
+            });
+          }
+          if (Array.isArray(obj)) return obj.map(substitute);
+          if (obj && typeof obj === 'object') {
+            const out: any = {};
+            for (const [k, v] of Object.entries(obj)) out[k] = substitute(v);
+            return out;
+          }
+          return obj;
+        };
+        const substitutedSteps = (skillDef.steps ?? []).map((s: any) => ({
+          ...s,
+          action: substitute(s.action),
+          description: substitute(s.description),
+        }));
+        const plan = { objectiveSummary: task.objective, steps: substitutedSteps, rationale: 'skill' };
+        task.plan = plan as any;
+        await this.taskRepo.update(task.id, { plan });
+        const outcome = await this.engine.executePlan(task, plan);
+        if (skillRunRepo) {
+          await skillRunRepo.complete(runId, outcome.status === 'completed' ? 'COMPLETED' : outcome.status.toUpperCase(), outcome.error ?? undefined);
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : 'Skill execution failed';
+        await this.taskRepo.update(task.id, { status: 'FAILED', error: msg });
+        if (skillRunRepo) await skillRunRepo.complete(runId, 'FAILED', msg);
+      }
+    })().catch(() => undefined);
+
+    return (await this.taskRepo.getById(task.id)) ?? task;
+  }
+
+  async startResearch(objective: string, approvedOrigins: string[], fields: Array<{ name: string; type: string; description?: string }>, pageBudget: number): Promise<Task> {
+    const cleaned = objective.trim();
+    if (cleaned.length === 0) throw new ServiceError('INVALID_OBJECTIVE', 'An objective is required');
+    const normalizedOrigins = normalizeOrigins(approvedOrigins ?? []);
+    if (normalizedOrigins.length === 0) throw new ServiceError('INVALID_ORIGIN', 'At least one approved origin is required', 400);
+
+    const task: Task = {
+      id: crypto.randomUUID(),
+      objective: cleaned,
+      status: 'PLANNING',
+      currentStepIndex: 0,
+      lastEventId: null,
+      plan: null,
+      planSummary: null,
+      plannerModel: this.plannerModel,
+      approvedOrigins: normalizedOrigins,
+      researchFields: fields ?? [],
+      researchBudget: pageBudget ?? 5,
+      error: null,
+    };
+    await this.taskRepo.create(task);
+
+    // Fire and forget
+    void this.runResearch(task).catch(() => undefined);
+    return (await this.taskRepo.getById(task.id)) ?? task;
+  }
+
+  async runResearch(task: Task): Promise<void> {
+    if (this.active.has(task.id)) return;
+    this.active.add(task.id);
+    const abort = new AbortController();
+    this.aborts.set(task.id, abort);
+    try {
+      const fresh = await this.taskRepo.getById(task.id);
+      if (!fresh) return;
+
+      const origins = fresh.approvedOrigins ?? [];
+      const fields = fresh.researchFields ?? [];
+      const budget = fresh.researchBudget ?? 5;
+      const findings: Array<{ field: string; value: string; sourceUrl: string; status: string }> = [];
+      const visited: string[] = [];
+
+      await this.taskRepo.update(task.id, { status: 'EXECUTING', error: null });
+      task.status = 'EXECUTING';
+
+      let pagesVisited = 0;
+      for (const origin of origins) {
+        if (pagesVisited >= budget) break;
+        if (abort.signal.aborted) break;
+        const url = origin;
+        visited.push(url);
+        pagesVisited++;
+        // Fetch page text (sanitized)
+        let text = '';
+        try {
+          const res = await fetch(url, { signal: abort.signal });
+          if (res.ok) {
+            const html = await res.text();
+            text = html.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 8000);
+          }
+        } catch {
+          text = '';
+        }
+        // Extract fields via simple pattern: "FieldName: value" or "FieldName = value"
+        for (const f of fields) {
+          const re = new RegExp(f.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*[:=]\s*([^.;\n]{1,200})', 'i');
+          const m = text.match(re);
+          const value = m ? m[1].trim() : null;
+          findings.push({
+            field: f.name,
+            value: value ?? 'UNAVAILABLE',
+            sourceUrl: url,
+            status: value ? 'unverified' : 'unavailable',
+          });
+        }
+        await this.createEvent(task.id, 'ACTION_FINISHED', { actionType: 'NAVIGATE', url, pagesVisited });
+      }
+
+      // Deduplicate: keep first occurrence per field
+      const seen = new Set<string>();
+      const deduped = findings.filter((f) => {
+        if (seen.has(f.field + ':' + f.value)) return false;
+        seen.add(f.field + ':' + f.value);
+        return true;
+      });
+
+      const result = { visited, findings: deduped, completedAt: new Date().toISOString() };
+      await this.taskRepo.update(task.id, { status: 'COMPLETED', researchResultJson: JSON.stringify(result), error: null });
+      task.status = 'COMPLETED';
+      await this.createEvent(task.id, 'TASK_COMPLETED', { research: true, findings: deduped.length });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Research failed';
+      await this.taskRepo.update(task.id, { status: 'FAILED', error: msg });
+      task.status = 'FAILED';
+      await this.createEvent(task.id, 'ERROR', { code: 'RESEARCH_ERROR', message: msg });
+    } finally {
+      this.active.delete(task.id);
+      this.aborts.delete(task.id);
+    }
+  }
+
   async runTask(task: Task): Promise<ExecutionOutcome | null> {
     if (this.active.has(task.id)) {
       throw new ServiceError('DUPLICATE_EXECUTION', 'Task is already running', 409);
@@ -128,82 +366,184 @@ export class TaskService {
         return null;
       }
 
-      await this.createEvent(task.id, 'PLANNING_STARTED', {
-        model: this.plannerModel,
-        maxSteps: LIMITS.MAX_PLAN_STEPS,
-        maxActions: LIMITS.MAX_EXECUTED_ACTIONS,
-        maxAttempts: LIMITS.MAX_PLANNER_ATTEMPTS,
-      });
-
-      const observations = await this.safeObservations();
-      const result = await this.planner.plan(
-        {
-          objective: fresh.objective,
-          observations,
-        },
-        { requestId: task.id, signal: abort.signal }
-      );
-
-      // A cancellation may land while the model is responding.
-      const afterPlanning = await this.taskRepo.getById(task.id);
-      if (!afterPlanning || afterPlanning.status === 'CANCELLED') {
-        return { status: 'cancelled', executedActions: 0 };
+      // Authorization must already be persisted on the task. Never create or
+      // widen it during execution. Missing/invalid authorization fails closed.
+      const normalized = normalizeOrigins(fresh.approvedOrigins ?? []);
+      if (normalized.length === 0) {
+        await this.taskRepo.update(task.id, {
+          status: 'FAILED',
+          error: 'Task authorization snapshot is missing or invalid; reauthorization required.',
+        });
+        await this.createEvent(task.id, 'ERROR', {
+          code: 'AUTHORIZATION_MISSING',
+          message: 'Task authorization snapshot is missing or invalid; reauthorization required.',
+        });
+        return { status: 'failed', error: 'Task authorization snapshot is missing or invalid', executedActions: 0 };
       }
+      fresh.approvedOrigins = normalized;
 
-      const plan = result.plan;
-      const policyResult = this.policy.validatePlan(plan, {
-        objective: fresh.objective,
-      });
-      if (!policyResult.allowed) {
-        // Defence in depth: the planner validated already, but execution never
-        // trusts a plan that changed after validation.
-        throw new PlanningError(
-          'POLICY_VIOLATION',
-          'The plan failed final policy validation',
-          result.attempts,
-          policyResult.violations.map((item) => item.message)
+      const MAX_ITERATIONS = 3;
+      const priorActions: Array<{ stepIndex: number; actionType: string; description?: string; outcome?: string }> = [];
+      const verificationResults: Array<{ stepIndex: number; outcome: string; method: string }> = [];
+      const seenPlans = new Set<string>();
+      let finalOutcome: ExecutionOutcome | null = null;
+
+      for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
+        const current = await this.taskRepo.getById(task.id);
+        if (!current || current.status === 'CANCELLED' || isTerminalStatus(current.status)) {
+          if (current?.status === 'CANCELLED') {
+            return { status: 'cancelled', executedActions: 0 };
+          }
+          if (current && isTerminalStatus(current.status)) {
+            // Already terminal (e.g., completed by a prior iteration).
+            break;
+          }
+          break;
+        }
+
+        await this.createEvent(task.id, 'PLANNING_STARTED', {
+          model: this.plannerModel,
+          maxSteps: LIMITS.MAX_PLAN_STEPS,
+          maxActions: LIMITS.MAX_EXECUTED_ACTIONS,
+          maxAttempts: LIMITS.MAX_PLANNER_ATTEMPTS,
+          iteration: iteration + 1,
+        });
+
+        const observations = await this.safeObservations();
+        const result = await this.planner.plan(
+          {
+            objective: fresh.objective,
+            observations,
+            approvedOrigins: fresh.approvedOrigins ?? this.policy.allowedOrigins,
+            priorActions,
+            verificationResults,
+          },
+          { requestId: task.id, signal: abort.signal }
         );
+
+        const afterPlanning = await this.taskRepo.getById(task.id);
+        if (!afterPlanning || afterPlanning.status === 'CANCELLED') {
+          return { status: 'cancelled', executedActions: 0 };
+        }
+
+        const plan = result.plan;
+        const policyResult = this.policy.validatePlan(plan, {
+          objective: fresh.objective,
+        });
+        if (!policyResult.allowed) {
+          throw new PlanningError(
+            'POLICY_VIOLATION',
+            'The plan failed final policy validation',
+            result.attempts,
+            policyResult.violations.map((item) => item.message)
+          );
+        }
+
+        // No-progress detection: identical plan repeated.
+        if (plan.steps.length === 0) {
+          // Planner signaled completion (or blocked). Verify against persisted evidence.
+          const events = await this.taskRepo.getEvents(task.id);
+          const lastVer = [...events].reverse().find((e) => e.type === 'VERIFICATION_RESULT');
+          const lastOutcome = lastVer?.data?.outcome;
+          if (lastOutcome === 'passed') {
+            await this.taskRepo.update(task.id, { status: 'COMPLETED', currentStepIndex: (task.plan?.steps.length ?? 0), error: null });
+            task.status = 'COMPLETED';
+            await this.createEvent(task.id, 'TASK_COMPLETED', { adaptive: true });
+            return { status: 'completed', executedActions: 0 };
+          }
+          await this.taskRepo.update(task.id, { status: 'FAILED', error: 'Planner reported completion but no verified success.' });
+          await this.createEvent(task.id, 'ERROR', { code: 'UNVERIFIED_COMPLETION', message: 'Planner reported completion without verified success.' });
+          return { status: 'failed', error: 'Unverified completion', executedActions: 0 };
+        }
+
+        const sig = JSON.stringify(plan.steps.map((s: any) => `${s.action?.type}:${s.action?.payload?.url ?? ''}`));
+        if (seenPlans.has(sig) && plan.steps.length > 0) {
+          await this.taskRepo.update(task.id, {
+            status: 'FAILED',
+            error: 'No progress detected (repeated plan); stopping safely.',
+          });
+          await this.createEvent(task.id, 'ERROR', {
+            code: 'NO_PROGRESS',
+            message: 'Repeated identical plan detected; stopping to avoid an infinite loop.',
+          });
+          return { status: 'failed', error: 'No progress detected', executedActions: 0 };
+        }
+        seenPlans.add(sig);
+
+        await this.taskRepo.update(task.id, {
+          status: 'PLAN_READY',
+          plan,
+          planSummary: plan.objectiveSummary,
+          plannerModel: result.model,
+          currentStepIndex: 0,
+          error: null,
+        });
+        Object.assign(task, {
+          status: 'PLAN_READY',
+          plan,
+          planSummary: plan.objectiveSummary,
+          plannerModel: result.model,
+          currentStepIndex: 0,
+          error: null,
+        });
+
+        await this.createEvent(task.id, 'PLANNING_COMPLETED', {
+          model: result.model,
+          attempts: result.attempts,
+          latencyMs: result.latencyMs,
+          stepCount: plan.steps.length,
+          iteration: iteration + 1,
+        });
+        await this.createEvent(task.id, 'PLAN_READY', {
+          objectiveSummary: plan.objectiveSummary,
+          stepCount: plan.steps.length,
+          rationale: plan.rationale,
+          approvalSteps: policyResult.approvalSteps,
+        });
+
+        const outcome = await this.engine.executePlan(task, plan);
+        finalOutcome = outcome;
+
+        if (outcome.status === 'completed') {
+          return outcome;
+        }
+        if (outcome.status === 'cancelled') {
+          return outcome;
+        }
+        if (outcome.status === 'awaiting_approval') {
+          return outcome;
+        }
+
+        // Failed: record for next iteration's context.
+        priorActions.push({ stepIndex: iteration, actionType: 'PLAN', outcome: outcome.status });
+        verificationResults.push({ stepIndex: iteration, outcome: outcome.status, method: 'engine' });
+
+        // Reset to PLANNING for next iteration.
+        await this.taskRepo.update(task.id, { status: 'PLANNING', error: null });
+        task.status = 'PLANNING';
       }
 
+      // Exhausted iterations.
       await this.taskRepo.update(task.id, {
-        status: 'PLAN_READY',
-        plan,
-        planSummary: plan.objectiveSummary,
-        plannerModel: result.model,
-        currentStepIndex: 0,
-        error: null,
+        status: 'FAILED',
+        error: 'Maximum replanning iterations reached without verification success.',
       });
-      Object.assign(task, {
-        status: 'PLAN_READY',
-        plan,
-        planSummary: plan.objectiveSummary,
-        plannerModel: result.model,
-        currentStepIndex: 0,
-        error: null,
+      await this.createEvent(task.id, 'ERROR', {
+        code: 'MAX_ITERATIONS',
+        message: 'Maximum replanning iterations reached.',
       });
-
-      await this.createEvent(task.id, 'PLANNING_COMPLETED', {
-        model: result.model,
-        attempts: result.attempts,
-        latencyMs: result.latencyMs,
-        stepCount: plan.steps.length,
-      });
-      await this.createEvent(task.id, 'PLAN_READY', {
-        objectiveSummary: plan.objectiveSummary,
-        stepCount: plan.steps.length,
-        // Rationale is untrusted explanatory text and is shown verbatim as
-        // text in the UI, never interpreted as instructions.
-        rationale: plan.rationale,
-        approvalSteps: policyResult.approvalSteps,
-      });
-
-      return await this.engine.executePlan(task, plan);
+      return finalOutcome ?? { status: 'failed', error: 'Maximum replanning iterations reached', executedActions: 0 };
     } catch (error) {
       if (error instanceof PlanningError) {
         return await this.handlePlanningFailure(task.id, error);
       }
       if (error instanceof ServiceError) {
         throw error;
+      }
+      if (task.status === 'CANCELLED') {
+        // A cancellation that landed while a recovery or vision step was in
+        // flight must not be overwritten with a failure reason.
+        return { status: 'cancelled', error: task.error ?? 'Cancelled by user', executedActions: 0 };
       }
       await this.taskRepo.update(task.id, {
         status: 'FAILED',

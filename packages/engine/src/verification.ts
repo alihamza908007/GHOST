@@ -1,8 +1,9 @@
-import { Action, Expectation, Locator, VerificationResult, isAllowedUrl } from '@ghost/core';
+import { Action, Expectation, Locator, VerificationResult, VisualEvaluation, isAllowedUrl } from '@ghost/core';
 import type { Locator as PlaywrightLocator, Page } from 'playwright';
 
 export interface VerificationContext {
   allowedOrigin: string;
+  allowedOrigins?: string[];
   taskId: string;
   evidenceDir: string;
   timeoutMs?: number;
@@ -55,7 +56,7 @@ async function checkExpectation(
 
   if (expectation.kind === 'url') {
     const current = page.url();
-    if (!isAllowedUrl(current, context.allowedOrigin)) {
+    if (!isAllowedUrl(current, context.allowedOrigins ?? context.allowedOrigin)) {
       return {
         outcome: 'failed',
         method: 'url-origin',
@@ -152,6 +153,63 @@ export async function evaluateExpectation(
 }
 
 /**
+ * Combine deterministic verification with optional visual perception using
+ * conservative rules. A deterministic pass stands alone; visual evidence never
+ * overrides a deterministic failure; uncertain vision keeps a failed result
+ * inconclusive; disagreement is surfaced through the returned evaluation.
+ */
+export function combineVerification(
+  deterministic: VerificationResult,
+  visual: VisualEvaluation | undefined,
+  taskId?: string,
+  stepIndex?: number
+): VerificationResult {
+  const base: VerificationResult = { ...deterministic, taskId, stepIndex };
+  const evaluation: VisualEvaluation = visual ?? { available: false, error: 'VISUAL_UNAVAILABLE' };
+
+  if (deterministic.outcome === 'passed') {
+    return { ...base, visual: evaluation, outcome: 'passed' };
+  }
+
+  const observation = evaluation.available ? evaluation.observation : undefined;
+  if (!observation) {
+    // Vision unavailable or failed: the deterministic result is preserved.
+    return { ...base, visual: evaluation };
+  }
+
+  if (observation.expectedCondition === 'uncertain') {
+    return {
+      ...base,
+      method: `${deterministic.method}+visual`,
+      outcome: 'inconclusive',
+      visual: { ...evaluation, agreed: false },
+      detail: `${deterministic.detail} | visual: ${observation.summary}`,
+    };
+  }
+
+  if (deterministic.outcome === 'failed') {
+    if (observation.expectedCondition === 'absent') {
+      // Consistent failure: deterministic postcondition and visual evidence
+      // agree that the expected state is absent.
+      return { ...base, visual: { ...evaluation, agreed: true }, outcome: 'failed' };
+    }
+    // Expected condition appears present but the deterministic check failed:
+    // conservative inconclusive result; visual never overrides the failure.
+    return {
+      ...base,
+      method: `${deterministic.method}+visual`,
+      outcome: 'inconclusive',
+      visual: { ...evaluation, agreed: false },
+      detail: `${deterministic.detail} | visual: ${observation.summary}`,
+    };
+  }
+
+  // Deterministic result was inconclusive; keep it inconclusive, optionally
+  // annotating with the visual diagnostic.
+  return { ...base, method: `${deterministic.method}+visual`, outcome: 'inconclusive', visual: { ...evaluation, agreed: false } };
+}
+
+/**
  * Independent, deterministic verification. It never uses model output as
  * evidence and never evaluates model-generated JavaScript.
  */
@@ -164,7 +222,7 @@ export async function verifyAction(
   const timestamp = Date.now();
 
   if (action.type === 'NAVIGATE') {
-    if (!isAllowedUrl(page.url(), context.allowedOrigin)) {
+    if (!isAllowedUrl(page.url(), context.allowedOrigins ?? context.allowedOrigin)) {
       return {
         outcome: 'failed',
         method: 'navigation-origin',

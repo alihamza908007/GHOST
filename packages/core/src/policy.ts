@@ -6,6 +6,7 @@ import {
   Plan,
   PlanStep,
 } from './schema.js';
+import { RecoveryAction } from './types.js';
 
 export type PolicyCode =
   | 'INVALID_ACTION'
@@ -20,7 +21,8 @@ export type PolicyCode =
   | 'SENSITIVE_FIELD'
   | 'HIGH_CONSEQUENCE_ACTION'
   | 'MISSING_REQUIRED_SCREENSHOT'
-  | 'WEAK_CLICK_POSTCONDITION';
+  | 'WEAK_CLICK_POSTCONDITION'
+  | 'RECOVERY_UNAUTHORIZED';
 
 export interface PlanPolicyOptions {
   /** Used only for deterministic coverage checks, never as model input. */
@@ -42,10 +44,13 @@ export interface PlanPolicyResult {
 }
 
 export interface ActionPolicyOptions {
-  allowedOrigin: string;
+  allowedOrigin?: string;
+  allowedOrigins?: string[];
   maxSteps?: number;
   maxActions?: number;
   maxNavigations?: number;
+  maxRecoveryAttempts?: number;
+  maxRetriesPerAction?: number;
   sensitiveFieldPattern?: RegExp;
   highConsequenceClickPattern?: RegExp;
 }
@@ -83,10 +88,38 @@ function expectationMatchesAction(step: PlanStep): boolean {
   }
 }
 
-export function isAllowedUrl(url: string, allowedOrigin: string): boolean {
+export function normalizeOrigin(value: string): string | null {
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    if (parsed.username || parsed.password) return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+export function normalizeOrigins(values: Array<string | null | undefined>): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const v of values) {
+    if (typeof v !== 'string') continue;
+    const n = normalizeOrigin(v);
+    if (!n) continue;
+    if (seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+  return out;
+}
+
+export function isAllowedUrl(url: string, allowedOrigins: string | string[]): boolean {
+  const set = normalizeOrigins(Array.isArray(allowedOrigins) ? allowedOrigins : [allowedOrigins]);
   try {
     const parsed = new URL(url);
-    return parsed.origin === allowedOrigin;
+    if (parsed.username || parsed.password) return false;
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    return set.includes(parsed.origin);
   } catch {
     return false;
   }
@@ -122,21 +155,36 @@ function locatorTargetText(locator: Locator): string {
  * engine (pre-action authorization). The model cannot influence these limits.
  */
 export class ActionPolicy {
-  readonly allowedOrigin: string;
+  readonly allowedOrigins: string[];
   readonly maxSteps: number;
   readonly maxActions: number;
   readonly maxNavigations: number;
+  readonly maxRecoveryAttempts: number;
+  readonly maxRetriesPerAction: number;
   private readonly sensitiveFieldPattern: RegExp;
   private readonly highConsequenceClickPattern: RegExp;
 
   constructor(options: ActionPolicyOptions) {
-    this.allowedOrigin = options.allowedOrigin;
+    const origins = normalizeOrigins([
+      ...(options.allowedOrigins ?? []),
+      options.allowedOrigin,
+    ]);
+    if (origins.length === 0) {
+      throw new Error('ActionPolicy requires at least one approved origin');
+    }
+    this.allowedOrigins = origins;
     this.maxSteps = options.maxSteps ?? LIMITS.MAX_PLAN_STEPS;
     this.maxActions = options.maxActions ?? LIMITS.MAX_EXECUTED_ACTIONS;
     this.maxNavigations = options.maxNavigations ?? 3;
+    this.maxRecoveryAttempts = options.maxRecoveryAttempts ?? LIMITS.MAX_RECOVERY_ATTEMPTS;
+    this.maxRetriesPerAction = options.maxRetriesPerAction ?? LIMITS.MAX_RECOVERY_RETRIES_PER_ACTION;
     this.sensitiveFieldPattern = options.sensitiveFieldPattern ?? DEFAULT_SENSITIVE_FIELD;
     this.highConsequenceClickPattern =
       options.highConsequenceClickPattern ?? DEFAULT_HIGH_CONSEQUENCE_CLICK;
+  }
+
+  get allowedOrigin(): string {
+    return this.allowedOrigins[0];
   }
 
   /** Re-validate a single action against schema and origin policy. */
@@ -153,7 +201,7 @@ export class ActionPolicy {
 
     const valid = parsed.data;
 
-    if (valid.type === 'NAVIGATE' && !isAllowedUrl(valid.payload.url, this.allowedOrigin)) {
+    if (valid.type === 'NAVIGATE' && !isAllowedUrl(valid.payload.url, this.allowedOrigins)) {
       return {
         allowed: false,
         requiresApproval: false,
@@ -182,7 +230,6 @@ export class ActionPolicy {
         };
       }
     }
-
     if (valid.type === 'CLICK') {
       const label = locatorText(valid.payload.locator);
       if (this.highConsequenceClickPattern.test(label)) {
@@ -196,6 +243,52 @@ export class ActionPolicy {
     }
 
     return { allowed: true, requiresApproval: false };
+  }
+
+  /**
+   * Policy gate for the narrow recovery catalog. Recovery dismissals must
+   * reference an allowlisted semantic close control and stay inside the
+   * approved origin. Retries are authorized through the normal action policy
+   * for the referenced step by the engine.
+   */
+  authorizeRecovery(
+    action: RecoveryAction,
+    options: { allowedOrigins: string[]; recoveryCloseAllowlist: string[] }
+  ): PolicyDecision {
+    if (action.kind === 'DISMISS_OVERLAY') {
+      const locator = action.locator;
+      const closeName =
+        locator.by === 'role'
+          ? (locator.name ?? '').toLowerCase()
+          : locator.by === 'testId'
+            ? (locator.testId ?? '').toLowerCase()
+            : (locator.label ?? '').toLowerCase();
+      const allowlist = (options.recoveryCloseAllowlist ?? [])
+        .map((entry) => (entry.startsWith('testid:') ? entry.slice('testid:'.length).toLowerCase() : entry.toLowerCase()))
+        .filter((entry) => entry.length > 0);
+      const allowed = allowlist.some((entry) => entry.length > 0 && entry === closeName);
+      if (!allowed) {
+        return {
+          allowed: false,
+          requiresApproval: false,
+          code: 'RECOVERY_UNAUTHORIZED',
+          reason: 'Overlay dismissal is not on the recovery allowlist',
+        };
+      }
+      return {
+        allowed: true,
+        requiresApproval: false,
+        code: undefined,
+        reason: 'Overlay dismissal is authorized by the recovery allowlist',
+      };
+    }
+
+    return {
+      allowed: false,
+      requiresApproval: false,
+      code: 'RECOVERY_UNAUTHORIZED',
+      reason: 'Retry recovery must be authorized through the action policy for the referenced step',
+    };
   }
 
   /**
@@ -301,7 +394,7 @@ export class ActionPolicy {
 
       if (
         step.expectation.kind === 'url' &&
-        !isAllowedUrl(step.expectation.value, this.allowedOrigin)
+        !isAllowedUrl(step.expectation.value, this.allowedOrigins)
       ) {
         violations.push({
           stepIndex,
@@ -310,7 +403,7 @@ export class ActionPolicy {
         });
       }
 
-      if (step.action.type === 'NAVIGATE' && !isAllowedUrl(step.action.payload.url, this.allowedOrigin)) {
+      if (step.action.type === 'NAVIGATE' && !isAllowedUrl(step.action.payload.url, this.allowedOrigins)) {
         violations.push({
           stepIndex,
           code: 'UNAPPROVED_ORIGIN',
