@@ -1,1 +1,23 @@
 node_modules
+
+# Build output
+.next/
+dist/
+*.tsbuildinfo
+
+# Local data and generated evidence
+prisma/dev.db
+prisma/dev.db-journal
+evidence_store/
+
+# Environment and logs
+.env
+.env.local
+*.log
+
+# Test output
+test-results/
+playwright-report/
+
+# OS/editor files
+.DS_Store

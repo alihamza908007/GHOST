@@ -8,12 +8,20 @@ datasource db {
 }
 
 model Task {
-  id              String      @id
-  objective       String
-  status          String
+  id               String            @id
+  objective        String
+  status           String
   currentStepIndex Int
-  lastEventId     String?
-  events          TaskEvent[]
+  lastEventId      String?
+  planJson         String?
+  planSummary      String?
+  plannerModel     String?
+  error            String?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @default(now()) @updatedAt
+  events           TaskEvent[]
+  evidence         Evidence[]
+  approvals        ApprovalRequest[]
 }
 
 model TaskEvent {
@@ -21,6 +29,35 @@ model TaskEvent {
   taskId    String
   type      String
   timestamp BigInt
-  data      String   // We will store JSON as string for SQLite compatibility if needed, or use Json type
+  seq       Int      @default(0)
+  data      String
   task      Task     @relation(fields: [taskId], references: [id])
+
+  @@index([taskId, seq])
+}
+
+model ApprovalRequest {
+  id          String   @id
+  taskId      String
+  stepIndex   Int
+  actionJson  String
+  status      String
+  reason      String
+  requestedAt BigInt
+  decidedAt   BigInt?
+  task        Task     @relation(fields: [taskId], references: [id])
+
+  @@index([taskId, status])
+}
+
+model Evidence {
+  id        String   @id
+  taskId    String
+  type      String
+  filename  String
+  size      Int
+  timestamp BigInt
+  task      Task     @relation(fields: [taskId], references: [id])
+
+  @@index([taskId])
 }

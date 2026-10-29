@@ -9,13 +9,19 @@
     "dev:web": "npm run dev -w apps/web",
     "dev:server": "npm run dev -w apps/server",
     "test": "vitest",
+    "test:run": "vitest run",
+    "test:integration": "GHOST_RUN_OLLAMA_INTEGRATION=1 vitest run packages/models/test/ollama.integration.test.ts",
     "test:e2e": "playwright test",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p apps/web"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p apps/web",
+    "probe:ollama": "tsx packages/models/scripts/probe-ollama.ts",
+    "eval:planner": "tsx packages/models/eval/planner-eval.ts",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev"
   },
   "devDependencies": {
     "@prisma/client": "^5.22.0",
     "prisma": "^5.22.0",
     "typescript": "^5.0.0",
-    "vitest": "^1.0.0"
+    "vitest": "5.0.5"
   }
 }

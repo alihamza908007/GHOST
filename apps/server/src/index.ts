@@ -1,115 +1,153 @@
-import Fastify from 'fastify';
-import path from 'path';
-import fs from 'fs';
-import crypto from 'crypto';
-import fastifyStatic from '@fastify/static';
-import { Task, TaskStatus, ActionType } from '@ghost/core';
-import { TaskRepository, EvidenceRepository } from '@ghost/storage';
-import { ExecutionEngine } from '@ghost/engine';
 import { PrismaClient } from '@prisma/client';
+import { ActionPolicy, CapabilitySnapshot } from '@ghost/core';
+import {
+  ApprovalRepository,
+  EvidenceRepository,
+  TaskRepository,
+} from '@ghost/storage';
+import { ExecutionEngine } from '@ghost/engine';
+import {
+  isModelError,
+  ModelProviderCapabilities,
+  OllamaProvider,
+  StructuredPlanner,
+} from '@ghost/models';
+import { createApp, ModelHealth } from './app.js';
+import { loadConfig, loadDotEnv } from './config.js';
+import { TaskService } from './task-service.js';
 
-const fastify = Fastify({ logger: true });
-
-// Configuration
-const ALLOWED_ORIGIN = 'http://127.0.0.1:3001';
-const EVIDENCE_DIR = process.env.EVIDENCE_DIR
-  ? path.resolve(process.env.EVIDENCE_DIR)
-  : fs.existsSync(path.resolve(process.cwd(), 'evidence_store'))
-    ? path.resolve(process.cwd(), 'evidence_store')
-    : path.resolve(process.cwd(), '../../evidence_store');
-
-// Ensure evidence dir exists
-if (!fs.existsSync(EVIDENCE_DIR)) {
-  fs.mkdirSync(EVIDENCE_DIR, { recursive: true });
+async function collectPageObservation(origin: string): Promise<string[]> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort('timeout'), 2_500);
+  try {
+    const response = await fetch(origin, {
+      signal: controller.signal,
+      redirect: 'manual',
+      headers: { accept: 'text/html' },
+    });
+    if (!response.ok) return [];
+    const contentType = response.headers.get('content-type') ?? '';
+    if (!contentType.includes('text/html')) return [];
+    const html = (await response.text()).slice(0, 50_000);
+    const text = html
+      .replace(/<script\b[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style\b[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return text ? [text.slice(0, 1_500)] : [];
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-// Initialize DB
-const prisma = new PrismaClient();
-const taskRepo = new TaskRepository(prisma);
-const evidenceRepo = new EvidenceRepository(EVIDENCE_DIR);
+async function main(): Promise<void> {
+  loadDotEnv();
+  const config = loadConfig();
 
-// Engine
-const engine = new ExecutionEngine(
-  taskRepo,
-  evidenceRepo,
-  ALLOWED_ORIGIN,
-  EVIDENCE_DIR
-);
+  const prisma = new PrismaClient();
+  const taskRepo = new TaskRepository(prisma);
+  const approvalRepo = new ApprovalRepository(prisma);
+  const evidenceRepo = new EvidenceRepository(config.evidenceDir, prisma);
 
-// Register static plugin to serve evidence
-fastify.register(fastifyStatic, {
-  root: EVIDENCE_DIR,
-  prefix: '/evidence/',
-});
+  const policy = new ActionPolicy({ allowedOrigin: config.allowedOrigin });
+  const provider = new OllamaProvider({
+    baseUrl: config.ollamaBaseUrl,
+    model: config.plannerModel,
+    timeoutMs: config.ollamaTimeoutMs,
+  });
+  const planner = new StructuredPlanner(provider, { policy });
+  const engine = new ExecutionEngine(
+    taskRepo,
+    evidenceRepo,
+    config.allowedOrigin,
+    config.evidenceDir,
+    {
+      policy,
+      approvalRepo,
+      taskTimeoutMs: config.executionTimeoutMs,
+      actionTimeoutMs: config.actionTimeoutMs,
+    }
+  );
 
-// Routes
-fastify.get('/health', async () => ({ status: 'ok' }));
+  const taskService = new TaskService({
+    taskRepo,
+    approvalRepo,
+    planner,
+    engine,
+    policy,
+    plannerModel: config.plannerModel,
+    observationProvider: () => collectPageObservation(config.allowedOrigin),
+  });
 
-fastify.post('/tasks/start', async (request, reply) => {
-  const taskId = crypto.randomUUID();
-  const task: Task = {
-    id: taskId,
-    objective: 'Demo vertical slice: Navigate and capture screenshot',
-    status: 'IDLE',
-    currentStepIndex: 0,
-    lastEventId: null
+  const recovered = await taskRepo.recoverInterrupted();
+  if (recovered > 0) {
+    console.log(`Recovered ${recovered} interrupted task(s); history was preserved.`);
+  }
+
+  let cachedHealth: { at: number; value: ModelHealth } | null = null;
+  const getModelHealth = async (): Promise<ModelHealth> => {
+    const now = Date.now();
+    if (cachedHealth && now - cachedHealth.at < config.modelProbeCacheMs) {
+      return cachedHealth.value;
+    }
+
+    let capabilities: ModelProviderCapabilities | null = null;
+    let error: ModelHealth['error'] = null;
+    try {
+      capabilities = await provider.probe({ testGeneration: false });
+    } catch (probeError) {
+      const code = isModelError(probeError) ? probeError.code : 'CONNECTION_FAILED';
+      const message = isModelError(probeError)
+        ? probeError.message
+        : 'Unable to probe the local planner model';
+      error = { code, message };
+    }
+
+    const snapshot: CapabilitySnapshot = {
+      plannerModel: config.plannerModel,
+      connected: capabilities?.connected ?? error?.code !== 'CONNECTION_FAILED',
+      modelAvailable: capabilities?.modelAvailable ?? false,
+      textGeneration: capabilities?.textGeneration ?? false,
+      structuredOutput: capabilities?.structuredOutput ?? false,
+      vision: capabilities?.vision ?? false,
+      degradedFeatures: capabilities?.degradedFeatures ?? ['planner_unavailable'],
+      lastErrorCode: error?.code,
+      checkedAt: now,
+    };
+
+    const value: ModelHealth = { capabilities: snapshot, error };
+    cachedHealth = { at: now, value };
+    return value;
   };
 
-  await taskRepo.create(task);
+  const app = await createApp({ config, taskService, getModelHealth });
 
-  // Plan: 1. Navigate, 2. Screenshot
-  const plan = [
-    { type: 'NAVIGATE', payload: { url: ALLOWED_ORIGIN } },
-    { type: 'SCREENSHOT', payload: { name: 'full-page' } }
-  ];
+  const shutdown = async () => {
+    provider.cancelAll();
+    await app.close().catch(() => undefined);
+    await prisma.$disconnect().catch(() => undefined);
+  };
+  process.once('SIGINT', () => void shutdown().then(() => process.exit(0)));
+  process.once('SIGTERM', () => void shutdown().then(() => process.exit(0)));
 
-  // Fire and forget the execution
-  (async () => {
-    try {
-      await engine.executePlan(task, plan as any);
-    } catch (e) {
-      console.error('Background execution failed', e);
-    }
-  })();
+  await app.listen({ port: config.port, host: '0.0.0.0' });
+  console.log(`GHOST Phase 2 server running at http://localhost:${config.port}`);
+  console.log(`Allowed demo origin: ${config.allowedOrigin}`);
+  console.log(`Planner model: ${config.plannerModel} (local Ollama only)`);
+}
 
-  return { taskId };
+main().catch((error) => {
+  // Deliberately avoid dumping prompts or model output.
+  console.error(
+    'GHOST server failed to start:',
+    error instanceof Error ? error.message : 'unknown error'
+  );
+  process.exit(1);
 });
-
-fastify.get('/tasks/:id', async (request: any) => {
-  const { id } = request.params;
-  const task = await taskRepo.getById(id);
-  if (!task) return { error: 'Not found' };
-  return task;
-});
-
-fastify.get('/tasks/:id/events', async (request: any) => {
-  const { id } = request.params;
-  const events = await taskRepo.getEvents(id);
-  return events;
-});
-
-fastify.get('/tasks/:id/screenshot-url', async (request: any) => {
-  const { id } = request.params;
-  const task = await taskRepo.getById(id);
-  if (!task) return { error: 'Not found' };
-
-  const events = await taskRepo.getEvents(id);
-  const screenshotEvent = events.find(e => e.type === 'ACTION_FINISHED' && 'screenshot' in e.data && e.data.screenshot);
-  
-  if (!screenshotEvent) return { error: 'No screenshot found' };
-
-  const screenshotName = screenshotEvent.data.screenshot as string;
-  return { url: `/evidence/${screenshotName}` };
-});
-
-const start = async () => {
-  try {
-    await fastify.listen({ port: 3002, host: '0.0.0.0' });
-    console.log('GHOST Server running at http://localhost:3002');
-  } catch (err) {
-    console.error(err);
-    process.exit(1);
-  }
-};
-
-start();

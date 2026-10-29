@@ -49,7 +49,7 @@ describe('@ghost/core zod schemas', () => {
     expect(() => TaskSchema.parse(validTask)).not.toThrow();
   });
 
-  it('validates NAVIGATE and SCREENSHOT action schemas', () => {
+  it('validates NAVIGATE, CLICK, FILL and SCREENSHOT action schemas', () => {
     const navAction = {
       type: 'NAVIGATE',
       payload: { url: 'http://127.0.0.1:3001' },
@@ -58,15 +58,31 @@ describe('@ghost/core zod schemas', () => {
       type: 'SCREENSHOT',
       payload: { name: 'test-screenshot' },
     };
+    const clickAction = {
+      type: 'CLICK',
+      payload: { locator: { by: 'role', role: 'button', name: 'Sign in' } },
+    };
+    const fillAction = {
+      type: 'FILL',
+      payload: { locator: { by: 'label', label: 'Email' }, value: 'demo@example.com' },
+    };
 
     expect(() => ActionSchema.parse(navAction)).not.toThrow();
     expect(() => ActionSchema.parse(screenshotAction)).not.toThrow();
+    expect(() => ActionSchema.parse(clickAction)).not.toThrow();
+    expect(() => ActionSchema.parse(fillAction)).not.toThrow();
 
     const invalidAction = {
+      type: 'EXECUTE_JS',
+      payload: { script: 'process.exit(1)' },
+    };
+    expect(() => ActionSchema.parse(invalidAction)).toThrow();
+
+    const selectorAction = {
       type: 'CLICK',
       payload: { selector: '#btn' },
     };
-    expect(() => ActionSchema.parse(invalidAction)).toThrow();
+    expect(() => ActionSchema.parse(selectorAction)).toThrow();
   });
 
   it('validates event schema', () => {
