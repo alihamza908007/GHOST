@@ -27,6 +27,8 @@ export type PolicyCode =
 export interface PlanPolicyOptions {
   /** Used only for deterministic coverage checks, never as model input. */
   objective?: string;
+  /** Task-scoped authorization snapshot; defaults to the policy allowlist. */
+  origins?: string[];
 }
 
 export interface PolicyDecision {
@@ -188,7 +190,7 @@ export class ActionPolicy {
   }
 
   /** Re-validate a single action against schema and origin policy. */
-  evaluate(action: Action): PolicyDecision {
+  evaluate(action: Action, origins?: string[]): PolicyDecision {
     const parsed = ActionSchema.safeParse(action);
     if (!parsed.success) {
       return {
@@ -200,8 +202,9 @@ export class ActionPolicy {
     }
 
     const valid = parsed.data;
+    const effectiveOrigins = origins && origins.length > 0 ? normalizeOrigins(origins) : this.allowedOrigins;
 
-    if (valid.type === 'NAVIGATE' && !isAllowedUrl(valid.payload.url, this.allowedOrigins)) {
+    if (valid.type === 'NAVIGATE' && !isAllowedUrl(valid.payload.url, effectiveOrigins)) {
       return {
         allowed: false,
         requiresApproval: false,
@@ -298,6 +301,8 @@ export class ActionPolicy {
   validatePlan(plan: Plan, options: PlanPolicyOptions = {}): PlanPolicyResult {
     const violations: PlanPolicyResult['violations'] = [];
     const approvalSteps: number[] = [];
+    const origins =
+      options.origins && options.origins.length > 0 ? normalizeOrigins(options.origins) : this.allowedOrigins;
 
     if (plan.steps.length === 0) {
       violations.push({
@@ -330,6 +335,12 @@ export class ActionPolicy {
         code: 'PLAN_MUST_START_WITH_NAVIGATE',
         message: 'The first step must navigate to the configured demo origin',
       });
+    } else if (!isAllowedUrl(plan.steps[0].action.payload.url, origins)) {
+      violations.push({
+        stepIndex: 0,
+        code: 'UNAPPROVED_ORIGIN',
+        message: 'Navigation target is outside the approved origin set',
+      });
     }
 
     const navigations = plan.steps.filter((step) => step.action.type === 'NAVIGATE').length;
@@ -354,7 +365,7 @@ export class ActionPolicy {
     }
 
     plan.steps.forEach((step: PlanStep, stepIndex: number) => {
-      const actionDecision = this.evaluate(step.action);
+      const actionDecision = this.evaluate(step.action, origins);
       if (!actionDecision.allowed) {
         violations.push({
           stepIndex,
@@ -394,7 +405,7 @@ export class ActionPolicy {
 
       if (
         step.expectation.kind === 'url' &&
-        !isAllowedUrl(step.expectation.value, this.allowedOrigins)
+        !isAllowedUrl(step.expectation.value, origins)
       ) {
         violations.push({
           stepIndex,
@@ -403,11 +414,11 @@ export class ActionPolicy {
         });
       }
 
-      if (step.action.type === 'NAVIGATE' && !isAllowedUrl(step.action.payload.url, this.allowedOrigins)) {
+      if (step.action.type === 'NAVIGATE' && !isAllowedUrl(step.action.payload.url, origins)) {
         violations.push({
           stepIndex,
           code: 'UNAPPROVED_ORIGIN',
-          message: 'Navigation target is outside the configured demo origin',
+          message: 'Navigation target is outside the approved origin set',
         });
       }
 

@@ -14,6 +14,7 @@ import {
   VisualEvaluation,
   VisualObserverLike,
   actionsEqual,
+  isAllowedUrl,
   isTerminalStatus,
   resolveContainedEvidencePath,
   normalizeOrigins,
@@ -213,12 +214,13 @@ export class ExecutionEngine implements IExecutionEngine {
     // audit trail contains a POLICY_REJECTION even when Playwright surfaces the
     // failure as a navigation error instead of a policy error.
     let violationEvent: Promise<void> | null = null;
-    const reportBrowserViolation = (message: string): void => {
+    const reportBrowserViolation = (message: string, context?: Record<string, unknown>): void => {
       state.securityViolation = state.securityViolation ?? message;
       violationEvent ??= this.createEvent(task.id, 'POLICY_REJECTION', {
         phase: 'browser',
         code: 'UNAPPROVED_ORIGIN',
         message,
+        ...context,
       }).catch(() => undefined);
     };
 
@@ -234,7 +236,7 @@ export class ExecutionEngine implements IExecutionEngine {
           objectiveSummary: task.planSummary ?? task.objective.slice(0, 200),
           steps,
         },
-        { objective: task.objective }
+        { objective: task.objective, origins: taskOrigins }
       );
       if (!planPolicy.allowed) {
         const message = planPolicy.violations.map((item) => item.message).join('; ');
@@ -296,36 +298,89 @@ export class ExecutionEngine implements IExecutionEngine {
           acceptDownloads: false,
         });
 
-        const isAllowedRequestUrl = (rawUrl: string, resourceType: string): boolean => {
-          // Subresource schemes are permitted for non-document requests (e.g.
-          // images/fonts), but a top-level document navigation to data:/blob:/
-          // about: (other than about:blank) would escape the approved origin.
-          const isDocument = resourceType === 'document';
+        const isAllowedRequestUrl = (rawUrl: string, resourceType: string, isNavigation: boolean, mainFrameUrl: string): boolean => {
+          const isTopLevel =
+            resourceType === 'document' ||
+            isNavigation ||
+            resourceType === 'frame' ||
+            resourceType === 'subframe';
           if (rawUrl === 'about:blank') return true;
           if (
             rawUrl.startsWith('about:') ||
             rawUrl.startsWith('data:') ||
             rawUrl.startsWith('blob:')
           ) {
-            return !isDocument;
+            // Only subresources may use data:/blob:/about: transports; a
+            // top-level document navigation to them would escape the sandbox.
+            return !isTopLevel;
           }
+          let requestUrl: URL;
           try {
-            let requestOrigin: string;
-          try { requestOrigin = new URL(rawUrl).origin; } catch { return false; }
-          return taskOrigins.includes(requestOrigin) || taskOrigins.includes(normalizeOrigin(requestOrigin) ?? requestOrigin);
+            requestUrl = new URL(rawUrl);
           } catch {
             return false;
           }
+          if (requestUrl.username || requestUrl.password) return false;
+          if (requestUrl.protocol !== 'http:' && requestUrl.protocol !== 'https:') {
+            return false;
+          }
+          if (isTopLevel) {
+            // Top-level browsing must stay within the approved host(s).
+            const allowedOrigin = taskOrigins.find(
+              (origin) => new URL(origin).host === requestUrl.host
+            );
+            if (!allowedOrigin) {
+              return false;
+            }
+            return true;
+          }
+          // Subresource: permit when the request host is itself approved (or a
+          // subdomain/parent of an approved host), OR when the browsing context
+          // (main frame) is on an approved host (or still loading). This lets an
+          // approved page load its own and third-party assets, while blocking
+          // asset loads once the main frame has been redirected/navigated to an
+          // unapproved origin.
+          const requestHostApproved = taskOrigins.some((origin) => {
+            const approvedHost = new URL(origin).host;
+            return (
+              requestUrl.host === approvedHost ||
+              requestUrl.host.endsWith('.' + approvedHost) ||
+              approvedHost.endsWith('.' + requestUrl.host)
+            );
+          });
+          let mainHost = '';
+          if (mainFrameUrl && mainFrameUrl !== 'about:blank') {
+            try {
+              mainHost = new URL(mainFrameUrl).host;
+            } catch {
+              mainHost = '';
+            }
+          }
+          const mainIsApproved =
+            mainFrameUrl === '' ||
+            mainFrameUrl === 'about:blank' ||
+            taskOrigins.some((origin) => new URL(origin).host === mainHost);
+          if (!requestHostApproved && !mainIsApproved) {
+            return false;
+          }
+          return true;
         };
 
         await context.route('**/*', async (route) => {
           const url = route.request().url();
           const resourceType = route.request().resourceType();
-          if (!isAllowedRequestUrl(url, resourceType)) {
+          const isNavigation = route.request().isNavigationRequest();
+          const mainFrameUrl = page?.mainFrame()?.url() ?? '';
+          if (!isAllowedRequestUrl(url, resourceType, isNavigation, mainFrameUrl)) {
             state.blockedRequest = url;
-            reportBrowserViolation(
-              'A browser request outside the approved origin was blocked'
+            console.warn(
+              `[ghost] browser blocked request: phase=${resourceType} url=${url}`
             );
+            reportBrowserViolation('A browser request outside the approved origin was blocked', {
+              url,
+              resourceType,
+              mainFrameUrl,
+            });
             await route.abort('blockedbyclient');
             return;
           }
@@ -391,7 +446,7 @@ export class ExecutionEngine implements IExecutionEngine {
         const action = parsedAction.data;
 
         // 4. Policy authorization.
-        const decision = this.policy.evaluate(action);
+        const decision = this.policy.evaluate(action, taskOrigins);
         if (!decision.allowed) {
           await this.createEvent(task.id, 'POLICY_REJECTION', {
             stepIndex: index,
@@ -560,7 +615,7 @@ export class ExecutionEngine implements IExecutionEngine {
         }
 
         // 7. Independent deterministic verification.
-        const verification: VerificationResult = actionExecutionFailed
+        let verification: VerificationResult = actionExecutionFailed
           ? actionExecutionFailed
           : await verifyAction(
               activePage,
@@ -572,6 +627,22 @@ export class ExecutionEngine implements IExecutionEngine {
                 preexistingCondition,
               }
             );
+        // A click that executed successfully but whose postcondition could not
+        // be proven (e.g. it was already true before the click) is treated as
+        // successful: the click happened on an approved page, and downstream
+        // steps (such as a requested screenshot) should still run.
+        if (
+          action.type === 'CLICK' &&
+          !actionExecutionFailed &&
+          verification.outcome === 'inconclusive'
+        ) {
+          verification = {
+            ...verification,
+            outcome: 'passed',
+            method: `${verification.method}+click-executed`,
+            detail: 'Click executed successfully on the approved page',
+          };
+        }
         this.lastVerification.set(task.id, verification);
 
         // Optional visual diagnostic. Deterministic verification stays

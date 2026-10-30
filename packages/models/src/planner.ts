@@ -159,7 +159,10 @@ export class StructuredPlanner {
           attempts,
           issues
         );
-        correction = `Policy violations: ${issues.join('; ')}.`;
+        correction =
+          unsupported
+            ? 'The previous response returned an empty plan. The objective appears to fit the supported actions, so propose concrete NAVIGATE/FILL/CLICK/SCREENSHOT steps. For web searches, NAVIGATE first, then FILL the search box, then CLICK the submit control, then SCREENSHOT if requested.'
+            : `Policy violations: ${issues.join('; ')}. If a violation mentions a form value being repeated in plan text, remove the value from descriptions and rationale and keep it only in the action payload.`;
         continue;
       }
 

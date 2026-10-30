@@ -3,6 +3,7 @@ import fastifyStatic from '@fastify/static';
 import { z } from 'zod';
 import { ApprovalRequestRecord, CapabilitySnapshot, Plan, Task } from '@ghost/core';
 import { GhostConfig } from './config.js';
+import { deriveSkillFromPlan, validateSkillDefinition } from './skills.js';
 import { ServiceError, TaskService } from './task-service.js';
 
 export interface ModelHealth {
@@ -88,6 +89,12 @@ function sendServiceError(reply: FastifyReply, error: unknown): void {
   reply.code(500).send({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
 }
 
+function mapTaskStatusToRunStatus(status: string): string {
+  if (status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED') return status;
+  if (status === 'AWAITING_APPROVAL') return 'AWAITING_APPROVAL';
+  return 'RUNNING';
+}
+
 export async function createApp(
   deps: AppDependencies,
   options: { logger?: boolean } = {}
@@ -114,7 +121,22 @@ export async function createApp(
   });
 
   fastify.setErrorHandler((error, request, reply) => {
-    request.log.error({ code: (error as { code?: string }).code ?? 'ERROR' }, 'request failed');
+    const statusCode = (error as { statusCode?: number }).statusCode;
+    request.log.error(
+      {
+        code: (error as { code?: string }).code ?? 'ERROR',
+        message: error instanceof Error ? error.message : 'Unknown error',
+      },
+      'request failed'
+    );
+    if (statusCode && statusCode >= 400 && statusCode < 500) {
+      const invalidJson = (error as { code?: string }).code === 'FST_ERR_CTP_INVALID_JSON_BODY';
+      reply.code(statusCode).send({
+        error: invalidJson ? 'Request body must be valid JSON' : (error as Error).message,
+        code: invalidJson ? 'INVALID_JSON' : 'INVALID_REQUEST',
+      });
+      return;
+    }
     reply.code(500).send({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   });
 
@@ -250,13 +272,45 @@ export async function createApp(
 
   fastify.post('/skills', async (request, reply) => {
     if (!deps.skillRepo) return reply.code(503).send({ error: 'Skill store unavailable', code: 'UNAVAILABLE' });
-    const body = (request.body ?? {}) as { name?: string; definition?: unknown };
-    if (!body.name || !body.definition) {
+    const body = (request.body ?? {}) as { name?: unknown; definition?: unknown };
+    if (typeof body.name !== 'string' || !body.name.trim() || !body.definition) {
       return reply.code(400).send({ error: 'name and definition required', code: 'INVALID_REQUEST' });
     }
-    const id = `skill-${Date.now()}`;
-    await deps.skillRepo.save({ id, name: body.name, definition: body.definition });
-    return reply.code(201).send({ id });
+    if (body.name.trim().length > 120) {
+      return reply.code(400).send({ error: 'Skill name must be 120 characters or fewer', code: 'INVALID_SKILL' });
+    }
+    const validated = validateSkillDefinition(body.definition);
+    if ('error' in validated) {
+      return reply.code(400).send({ error: validated.error, code: 'INVALID_SKILL' });
+    }
+    const id = `skill-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    await deps.skillRepo.save({ id, name: body.name.trim(), definition: validated.definition });
+    return reply.code(201).send({ id, definition: validated.definition });
+  });
+
+  fastify.post<{ Params: { id: string } }>('/tasks/:id/skill', async (request, reply) => {
+    if (!deps.skillRepo) return reply.code(503).send({ error: 'Skill store unavailable', code: 'UNAVAILABLE' });
+    const task = await taskService.getTask(request.params.id);
+    if (!task) return reply.code(404).send({ error: 'Task not found', code: 'NOT_FOUND' });
+    if (task.status !== 'COMPLETED' || !task.plan) {
+      return reply
+        .code(409)
+        .send({ error: 'Only completed tasks with a plan can be saved as skills', code: 'TASK_NOT_COMPLETED' });
+    }
+    const body = (request.body ?? {}) as { name?: unknown };
+    const fallback = task.planSummary ?? task.plan.objectiveSummary ?? `Skill ${task.id.slice(0, 8)}`;
+    const name =
+      typeof body.name === 'string' && body.name.trim()
+        ? body.name.trim().slice(0, 120)
+        : fallback.slice(0, 120);
+    const derived = deriveSkillFromPlan(task.id, task.plan, name, task.planSummary);
+    const validated = validateSkillDefinition(derived.definition);
+    if ('error' in validated) {
+      return reply.code(422).send({ error: validated.error, code: 'INVALID_SKILL' });
+    }
+    const id = `skill-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    await deps.skillRepo.save({ id, name, definition: validated.definition });
+    return reply.code(201).send({ id, inputs: derived.inputNames, definition: validated.definition });
   });
 
   fastify.post<{ Params: { id: string } }>('/skills/:id/run', async (request, reply) => {
@@ -264,6 +318,12 @@ export async function createApp(
     const skill = await deps.skillRepo.get(request.params.id);
     if (!skill) return reply.code(404).send({ error: 'Skill not found', code: 'NOT_FOUND' });
     const body = (request.body ?? {}) as { inputs?: Record<string, unknown>; approvedOrigins?: string[] };
+    if (body.inputs !== undefined && (typeof body.inputs !== 'object' || body.inputs === null || Array.isArray(body.inputs))) {
+      return reply.code(400).send({ error: 'inputs must be an object', code: 'INVALID_REQUEST' });
+    }
+    if (body.approvedOrigins !== undefined && !Array.isArray(body.approvedOrigins)) {
+      return reply.code(400).send({ error: 'approvedOrigins must be an array', code: 'INVALID_REQUEST' });
+    }
     try {
       const task = await taskService.runSkill(skill, body.inputs ?? {}, body.approvedOrigins);
       return reply.code(202).send({ taskId: task.id });
@@ -275,7 +335,29 @@ export async function createApp(
   fastify.get<{ Params: { id: string } }>('/skills/:id/runs', async (request, reply) => {
     if (!deps.skillRunRepo) return reply.code(503).send({ error: 'Skill run store unavailable', code: 'UNAVAILABLE' });
     const runs = await deps.skillRunRepo.list(request.params.id);
-    return { runs };
+    // A skill run pauses with its task for approval and resumes later, so the
+    // persisted run status can lag behind the linked task. Reconcile on read so
+    // history reflects the task that actually executed.
+    const reconciled = await Promise.all(
+      runs.map(async (run) => {
+        if (!run.taskId) return run;
+        try {
+          const task = await taskService.getTask(run.taskId);
+          if (!task) return run;
+          const status = mapTaskStatusToRunStatus(task.status);
+          const terminal = ['COMPLETED', 'FAILED', 'CANCELLED'].includes(task.status);
+          return {
+            ...run,
+            status,
+            error: task.error ?? run.error ?? null,
+            completedAt: terminal ? (run.completedAt ?? new Date(task.updatedAt ?? Date.now())) : null,
+          };
+        } catch {
+          return run;
+        }
+      })
+    );
+    return { runs: reconciled };
   });
 
   return fastify;

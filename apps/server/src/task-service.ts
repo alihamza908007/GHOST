@@ -427,8 +427,25 @@ export class TaskService {
         }
 
         const plan = result.plan;
+        // The task's approved origin set is authoritative for the first
+        // navigation; the planner may not silently fall back to a different
+        // origin it associates with the workflow.
+        const taskApproved = normalizeOrigins(fresh.approvedOrigins ?? []);
+        if (taskApproved.length > 0 && plan.steps[0]?.action?.type === 'NAVIGATE') {
+          const forcedAction = { ...plan.steps[0].action, payload: { url: taskApproved[0] } };
+          const forcedExpectation =
+            plan.steps[0].expectation?.kind === 'url'
+              ? { ...plan.steps[0].expectation, value: taskApproved[0] }
+              : plan.steps[0].expectation;
+          plan.steps[0] = {
+            ...plan.steps[0],
+            action: forcedAction,
+            expectation: forcedExpectation,
+          } as typeof plan.steps[0];
+        }
         const policyResult = this.policy.validatePlan(plan, {
           objective: fresh.objective,
+          origins: taskApproved.length > 0 ? taskApproved : this.policy.allowedOrigins,
         });
         if (!policyResult.allowed) {
           throw new PlanningError(
@@ -614,8 +631,12 @@ export class TaskService {
     }
 
     // Revalidate schema and policy after approval. Approval cannot broaden
-    // the action schema or the configured origin.
-    const decision = this.policy.evaluate(step.action);
+    // the action schema or the task authorization snapshot.
+    const taskForDecision = await this.taskRepo.getById(taskId);
+    const approvedForDecision = taskForDecision
+      ? normalizeOrigins(taskForDecision.approvedOrigins ?? [])
+      : this.policy.allowedOrigins;
+    const decision = approvedForDecision.length > 0 ? this.policy.evaluate(step.action, approvedForDecision) : this.policy.evaluate(step.action);
     if (!decision.allowed) {
       await this.approvalRepo.decide(pending.id, 'REJECTED');
       await this.engine.discardPausedSession?.(taskId);

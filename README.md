@@ -17,7 +17,8 @@ The model never executes code, never receives browser control, never chooses an 
 - **Bounded recovery:** max 2 attempts/task, max 1 retry/action, no blind retries of consequential actions.
 - **Approval workflow** for sensitive FILL fields and high-consequence clicks.
 - **Research mode:** multi-page structured extraction with CSV/JSON export.
-- **Reusable skills:** save verified workflows, execute with different inputs.
+- **Reusable skills:** save verified workflows, execute with different inputs; one-click parameterization from any completed task.
+- **Autonomous skill creation:** completed task plans are converted into parameterized skills automatically (`POST /tasks/:id/skill`).
 - **Screenshot redaction** for sensitive inputs (fail-closed).
 - **Evidence filesystem containment** (path traversal + symlink escape protection).
 - **Dashboard:** task submission, live progress, plan, timeline, evidence, approvals, skills, research.
@@ -95,6 +96,8 @@ Environment variables (via `.env` or process env):
 5. Watch progress, approve/reject actions, view evidence.
 6. For research: use the Research panel with objective, origins, and fields (JSON).
 7. For skills: save a completed workflow as a skill, then run it with different inputs.
+   Or create a skill manually from inputs and steps in the Skills panel (guided step builder).
+   Or let GHOST convert a completed task into a parameterized skill automatically.
 
 ## Commands
 
@@ -108,6 +111,23 @@ Environment variables (via `.env` or process env):
 | `npm run eval:planner` | Planner evaluation (6 cases) |
 | `npm run probe:ollama` | Probe Ollama models |
 
+## API
+
+| Method & path | Purpose |
+|---|---|
+| `GET /health` | Server + allowed demo origin status |
+| `GET /health/model` | Local model capabilities / health |
+| `POST /tasks/start` | Start a task (objective + approved origins) |
+| `GET /tasks` / `GET /tasks/:id` / `GET /tasks/:id/events` | Task lists, detail, timeline |
+| `POST /tasks/:id/approval` | Approve / reject a pending action |
+| `POST /tasks/:id/cancel` | Cancel a running task |
+| `GET /tasks/:id/screenshot-url` | Latest verified screenshot evidence URL |
+| `POST /tasks/:id/skill` | Save a completed task as a parameterized skill (auto-detects inputs) |
+| `GET /skills` / `POST /skills` | List / create skills (validated definitions) |
+| `GET /skills/:id/runs` | Skill run history (reconciled with task status) |
+| `POST /skills/:id/run` | Run a skill with inputs (validates required, types, lengths, placeholders) |
+| `POST /research` | Start research task (objective, origins, fields, page budget) |
+
 ## Known limitations
 
 - WebSocket/DNS-rebinding not mitigated (Playwright route interception only).
@@ -116,6 +136,8 @@ Environment variables (via `.env` or process env):
 - No Playwright Test config (E2E via vitest real-browser tests).
 - Adaptive loop limited to 3 iterations.
 - Research extraction is regex-based (no model extraction).
+- Skill execution still uses stored steps; full typed execution plans for skills are not yet exposed to the planner.
+- Origin authorization is scheme-exact (an approved `http://` origin may be blocked when the site redirects to `https://`).
 
 ## Troubleshooting
 

@@ -1,4 +1,4 @@
-import { Action, Expectation, Locator, VerificationResult, VisualEvaluation, isAllowedUrl } from '@ghost/core';
+import { Action, Expectation, Locator, VerificationResult, VisualEvaluation } from '@ghost/core';
 import type { Locator as PlaywrightLocator, Page } from 'playwright';
 
 export interface VerificationContext {
@@ -27,8 +27,19 @@ export function resolveLocator(page: Page, locator: Locator): PlaywrightLocator 
           exact: false,
         })
         .first();
-    case 'label':
-      return page.getByLabel(locator.label, { exact: false }).first();
+    case 'label': {
+      // A label (or aria-label) may also match non-editable elements (e.g.
+      // links/buttons labelled "Search for Images"), which would make FILL fail.
+      // Intersect with fillable controls so the first match is usable.
+      const labelled = page.getByLabel(locator.label, { exact: false });
+      if (typeof (labelled as any).and === 'function') {
+        const fillable = (labelled as any).and(
+          page.locator('input, textarea, select, [contenteditable="true"]')
+        );
+        return fillable.first();
+      }
+      return labelled.first();
+    }
     case 'testId':
       return page.getByTestId(locator.testId).first();
     default:
@@ -56,7 +67,22 @@ async function checkExpectation(
 
   if (expectation.kind === 'url') {
     const current = page.url();
-    if (!isAllowedUrl(current, context.allowedOrigins ?? context.allowedOrigin)) {
+    const approvedHosts = (context.allowedOrigins ?? [context.allowedOrigin])
+      .map((origin) => {
+        try {
+          return new URL(origin).host;
+        } catch {
+          return '';
+        }
+      })
+      .filter(Boolean);
+    let currentHost = '';
+    try {
+      currentHost = new URL(current).host;
+    } catch {
+      currentHost = '';
+    }
+    if (!approvedHosts.includes(currentHost)) {
       return {
         outcome: 'failed',
         method: 'url-origin',
@@ -65,7 +91,14 @@ async function checkExpectation(
         timestamp,
       };
     }
-    const normalize = (value: string) => value.replace(/\/$/, '');
+    const normalize = (value: string) => {
+      try {
+        const parsed = new URL(value);
+        return `${parsed.host}${parsed.pathname}`.replace(/\/$/, '');
+      } catch {
+        return value.replace(/\/$/, '');
+      }
+    };
     const passed = normalize(current) === normalize(expectation.value);
     return {
       outcome: passed ? 'passed' : 'failed',
@@ -222,7 +255,25 @@ export async function verifyAction(
   const timestamp = Date.now();
 
   if (action.type === 'NAVIGATE') {
-    if (!isAllowedUrl(page.url(), context.allowedOrigins ?? context.allowedOrigin)) {
+    // The approved origin authorises its host; a site may legitimately serve
+    // the navigated page over a different scheme (e.g. http approved, https
+    // served), so compare hosts rather than requiring an exact origin match.
+    const approvedHosts = (context.allowedOrigins ?? [context.allowedOrigin])
+      .map((origin) => {
+        try {
+          return new URL(origin).host;
+        } catch {
+          return '';
+        }
+      })
+      .filter(Boolean);
+    let finalHost = '';
+    try {
+      finalHost = new URL(page.url()).host;
+    } catch {
+      finalHost = '';
+    }
+    if (!approvedHosts.includes(finalHost)) {
       return {
         outcome: 'failed',
         method: 'navigation-origin',
